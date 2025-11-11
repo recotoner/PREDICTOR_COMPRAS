@@ -33,6 +33,51 @@ DEFAULT_MAKE_WEBHOOK_S3_URL = "https://hook.us1.make.com/k50t6u1rtrswqd6vl4s8mqf
 REPORT_APP_URL = "http://localhost:8504"   # cámbiala en server
 
 # ======================================
+# STREAMLIT BASE
+# ======================================
+st.set_page_config(page_title="Predictor de Compras", layout="wide")
+
+# CSS para que el select de la barra lateral se vea sobre fondo oscuro
+st.markdown(
+    """
+    <style>
+    /* Sidebar entero oscuro ya lo tienes en tu tema, aquí solo afinamos el select */
+    [data-testid="stSidebar"] .stSelectbox > div > div {
+        background-color: #0f172a !important;  /* mismo azul oscuro del sidebar */
+        border: 1px solid rgba(255, 255, 255, 0.25) !important;
+        color: #ffffff !important;
+        border-radius: 8px !important;
+    }
+    [data-testid="stSidebar"] .stSelectbox label {
+        color: #ffffff !important;
+    }
+    [data-testid="stSidebar"] .stSelectbox svg {
+        color: #ffffff !important;
+    }
+    /* inputs del cuerpo un poco más marcados */
+    .stTextInput > div > div,
+    .stSelectbox:not([data-testid="stSidebar"] .stSelectbox) > div > div {
+        border: 1px solid rgba(15, 23, 42, 0.15) !important;
+        border-radius: 10px !important;
+    }
+    /* botón principal verde */
+    .stButton > button {
+        background-color: #0f766e !important;
+        color: #ffffff !important;
+        border: none !important;
+        border-radius: 10px !important;
+        height: 46px;
+        font-weight: 600;
+    }
+    .stButton > button:hover {
+        background-color: #115e57 !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ======================================
 # HELPERS DE LECTURA
 # ======================================
 def read_gsheets(sheet_id: str, tab: str) -> pd.DataFrame:
@@ -59,9 +104,8 @@ def load_clientes_config() -> Optional[pd.DataFrame]:
     except Exception:
         return None
 
-
 # ======================================
-# NORMALIZADORES (los tuyos)
+# NORMALIZADORES
 # ======================================
 def _is_numeric_col(s: pd.Series) -> bool:
     return pd.to_numeric(s, errors="coerce").notna().sum() > 0
@@ -181,6 +225,7 @@ def normalize_config_sheet(df: pd.DataFrame,
 
 
 def normalize_inbound_sheet(df: pd.DataFrame) -> pd.DataFrame:
+    """Versión robusta: si hay filas sin estado, no rompe."""
     if df is None or df.empty:
         return pd.DataFrame(columns=["sku", "qty", "eta", "estado"])
     cols = {c.lower(): c for c in df.columns}
@@ -191,10 +236,13 @@ def normalize_inbound_sheet(df: pd.DataFrame) -> pd.DataFrame:
     if not sku_c or not qty_c:
         return pd.DataFrame(columns=["sku", "qty", "eta", "estado"])
     out = pd.DataFrame()
-    out["sku"]    = df[sku_c].astype(str).str.strip().str.upper()
-    out["qty"]    = pd.to_numeric(df[qty_c], errors="coerce").fillna(0)
-    out["eta"]    = pd.to_datetime(df[eta_c], errors="coerce") if eta_c else pd.NaT
-    out["estado"] = df[est_c].astype(str).upper().str.strip() if est_c else "ABIERTA"
+    out["sku"] = df[sku_c].astype(str).str.strip().str.upper()
+    out["qty"] = pd.to_numeric(df[qty_c], errors="coerce").fillna(0)
+    out["eta"] = pd.to_datetime(df[eta_c], errors="coerce") if eta_c else pd.NaT
+    if est_c:
+        out["estado"] = df[est_c].astype(str).str.upper().str.strip()
+    else:
+        out["estado"] = "ABIERTA"
     out = out[out["qty"] > 0]
     return out
 
@@ -213,7 +261,6 @@ def prepare_inbound_for_core(inbound: pd.DataFrame) -> pd.DataFrame:
     df_grp["estado"] = "PENDIENTE"
     return df_grp
 
-
 # ======================================
 # UTIL WEBHOOK
 # ======================================
@@ -226,11 +273,9 @@ def trigger_make(url: str, payload: dict) -> dict:
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-
 # ======================================
 # UI
 # ======================================
-st.set_page_config(page_title="Predictor de Compras", layout="wide")
 
 # multi-tenant (opcional)
 clientes_df = load_clientes_config()
@@ -258,6 +303,8 @@ if clientes_df is not None and len(clientes_df):
     MAKE_WEBHOOK_S1_URL = row.get("webhook_s1", DEFAULT_MAKE_WEBHOOK_S1_URL)
     MAKE_WEBHOOK_S2_URL = row.get("webhook_s2", DEFAULT_MAKE_WEBHOOK_S2_URL)
     MAKE_WEBHOOK_S3_URL = row.get("webhook_s3", DEFAULT_MAKE_WEBHOOK_S3_URL)
+else:
+    st.sidebar.selectbox("Cliente", ["(sin clientes_config)"])
 
 # --- navegación lateral ---
 st.sidebar.markdown("### Navegación")
@@ -267,7 +314,7 @@ st.sidebar.markdown(
 st.sidebar.markdown("---")
 
 modo_datos = "ONLINE (KAME ERP)" if not OFFLINE else "OFFLINE (CSV)"
-st.title("🧠 Predictor de Compras")
+st.title("🧠 Predictor de Compras ↪")
 st.caption(f"Fuente de datos: **{modo_datos}** — Tenant: **{CURRENT_TENANT_ID}**")
 
 # Botones (3)
@@ -443,6 +490,10 @@ if st.button("Ejecutar predicción", type="primary", use_container_width=True):
             "pred_detalle.csv",
             "text/csv",
         )
+
+
+
+
 
 
 
