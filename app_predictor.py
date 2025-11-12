@@ -29,22 +29,20 @@ DEFAULT_MAKE_WEBHOOK_S1_URL = "https://hook.us1.make.com/1pdchxe8cl7qg2oo7byqi4u
 DEFAULT_MAKE_WEBHOOK_S2_URL = "https://hook.us1.make.com/vdj87rfcjpmeuccds9vieu45410tnsug"
 DEFAULT_MAKE_WEBHOOK_S3_URL = "https://hook.us1.make.com/k50t6u1rtrswqd6vl4s8mqf2ndu6noa3"
 
-# URLs de otras apps (para navegación)
-REPORT_APP_URL = "https://reporteria-compras.onrender.com/"
-# cámbiala en server
+# URL de reportería (solo respaldo, la real se lee del sheet del tenant)
+REPORT_APP_URL = "http://localhost:8504"
 
 # ======================================
 # STREAMLIT BASE
 # ======================================
 st.set_page_config(page_title="Predictor de Compras", layout="wide")
 
-# CSS para que el select de la barra lateral se vea sobre fondo oscuro
+# CSS
 st.markdown(
     """
     <style>
-    /* Sidebar entero oscuro ya lo tienes en tu tema, aquí solo afinamos el select */
     [data-testid="stSidebar"] .stSelectbox > div > div {
-        background-color: #0f172a !important;  /* mismo azul oscuro del sidebar */
+        background-color: #0f172a !important;
         border: 1px solid rgba(255, 255, 255, 0.25) !important;
         color: #ffffff !important;
         border-radius: 8px !important;
@@ -55,13 +53,11 @@ st.markdown(
     [data-testid="stSidebar"] .stSelectbox svg {
         color: #ffffff !important;
     }
-    /* inputs del cuerpo un poco más marcados */
     .stTextInput > div > div,
     .stSelectbox:not([data-testid="stSidebar"] .stSelectbox) > div > div {
         border: 1px solid rgba(15, 23, 42, 0.15) !important;
         border-radius: 10px !important;
     }
-    /* botón principal verde */
     .stButton > button {
         background-color: #0f766e !important;
         color: #ffffff !important;
@@ -104,6 +100,23 @@ def load_clientes_config() -> Optional[pd.DataFrame]:
         return df
     except Exception:
         return None
+
+
+@st.cache_data
+def load_global_urls(sheet_id: str) -> dict:
+    """Lee la hoja config y devuelve predictor_url y reporteria_url (fila 1)."""
+    try:
+        df = read_gsheets(sheet_id, TAB_CONFIG)
+        if df.empty:
+            return {}
+        df.columns = [str(c).strip().lower() for c in df.columns]
+        row = df.iloc[0]
+        return {
+            "predictor_url": str(row.get("predictor_url", "")).strip(),
+            "reporteria_url": str(row.get("reporteria_url", "")).strip(),
+        }
+    except Exception:
+        return {}
 
 # ======================================
 # NORMALIZADORES
@@ -163,6 +176,11 @@ def normalize_stock_sheet(df: pd.DataFrame) -> pd.DataFrame:
 def normalize_config_sheet(df: pd.DataFrame,
                            ventas_n: pd.DataFrame,
                            stock_n: pd.DataFrame) -> pd.DataFrame:
+    """
+    Devuelve SIEMPRE un dataframe por SKU.
+    Si la hoja viene en modo global (1 fila) replica los valores a todos los SKU
+    y también trae predictor_url / reporteria_url.
+    """
     if df.empty:
         skus = sorted(set(ventas_n["sku"]).union(set(stock_n["sku"])))
         return pd.DataFrame(
@@ -175,12 +193,15 @@ def normalize_config_sheet(df: pd.DataFrame,
                 "alias": None,
                 "activo": True,
                 "seguridad_dias": 0,
+                "predictor_url": None,
+                "reporteria_url": None,
             }
         )
 
     df2 = df.copy()
     df2.columns = [str(c).strip().lower() for c in df2.columns]
 
+    # ----- caso 1: por SKU -----
     if "sku" in df2.columns:
         rename_map = {
             "min_lote": "minimo_compra",
@@ -188,10 +209,13 @@ def normalize_config_sheet(df: pd.DataFrame,
             "multiplo_lote": "multiplo",
         }
         df2 = df2.rename(columns={k: v for k, v in rename_map.items() if k in df2.columns})
+
         for c in ["lead_time_dias", "minimo_compra", "multiplo", "seguridad_dias"]:
             if c in df2.columns:
                 df2[c] = pd.to_numeric(df2[c], errors="coerce").fillna(0)
+
         df2["sku"] = df2["sku"].astype(str).str.strip().str.upper()
+
         for c, default in [
             ("proveedor", ""),
             ("minimo_compra", 1),
@@ -199,15 +223,21 @@ def normalize_config_sheet(df: pd.DataFrame,
             ("alias", None),
             ("activo", True),
             ("seguridad_dias", 0),
+            ("predictor_url", None),
+            ("reporteria_url", None),
         ]:
             if c not in df2.columns:
                 df2[c] = default
+
         return df2
 
-    # config global
+    # ----- caso 2: global -----
     lead_time = int(pd.to_numeric(df2.get("lead_time_dias", pd.Series([0])).iloc[0], errors="coerce") or 0)
     seg_dias  = int(pd.to_numeric(df2.get("seguridad_dias", pd.Series([0])).iloc[0], errors="coerce") or 0)
     min_lote  = int(pd.to_numeric(df2.get("min_lote", pd.Series([1])).iloc[0], errors="coerce") or 1)
+
+    predictor_url  = df2.get("predictor_url",  pd.Series([None])).iloc[0]
+    reporteria_url = df2.get("reporteria_url", pd.Series([None])).iloc[0]
 
     skus = sorted(set(ventas_n["sku"]).union(set(stock_n["sku"])))
     cfg = pd.DataFrame(
@@ -220,6 +250,8 @@ def normalize_config_sheet(df: pd.DataFrame,
             "alias": None,
             "activo": True,
             "seguridad_dias": seg_dias,
+            "predictor_url": predictor_url,
+            "reporteria_url": reporteria_url,
         }
     )
     return cfg
@@ -275,10 +307,9 @@ def trigger_make(url: str, payload: dict) -> dict:
         return {"ok": False, "error": str(e)}
 
 # ======================================
-# UI
+# UI / MULTITENANT con sesión
 # ======================================
 
-# multi-tenant (opcional)
 clientes_df = load_clientes_config()
 
 CURRENT_SHEET_ID = DEFAULT_SHEET_ID
@@ -288,14 +319,36 @@ MAKE_WEBHOOK_S3_URL = DEFAULT_MAKE_WEBHOOK_S3_URL
 CURRENT_TENANT_ID   = "default"
 KAME_CLIENT_ID      = ""
 KAME_CLIENT_SECRET  = ""
-USE_STOCK_TOTAL     = False  # está en la hoja igual, pero al final no sumamos transición
+USE_STOCK_TOTAL     = False
+
+# leemos tenant de la URL si viene
+params = st.query_params
+tenant_from_url = params.get("tenant", None)
 
 if clientes_df is not None and len(clientes_df):
     tenant_ids = clientes_df["tenant_id"].tolist()
-    tenant_sel = st.sidebar.selectbox("Cliente", tenant_ids, index=0)
-    row = clientes_df[clientes_df["tenant_id"] == tenant_sel].iloc[0]
 
-    CURRENT_TENANT_ID  = row["tenant_id"]
+    # decidir tenant
+    if tenant_from_url and tenant_from_url in tenant_ids:
+        CURRENT_TENANT_ID = tenant_from_url
+        st.session_state["tenant_id"] = tenant_from_url
+    else:
+        # mirar sesión
+        if "tenant_id" in st.session_state and st.session_state["tenant_id"] in tenant_ids:
+            CURRENT_TENANT_ID = st.session_state["tenant_id"]
+        else:
+            # default al primero
+            CURRENT_TENANT_ID = tenant_ids[0]
+            st.session_state["tenant_id"] = CURRENT_TENANT_ID
+
+    # select visible
+    sel = st.sidebar.selectbox("Cliente", tenant_ids, index=tenant_ids.index(CURRENT_TENANT_ID))
+    if sel != CURRENT_TENANT_ID:
+        CURRENT_TENANT_ID = sel
+        st.session_state["tenant_id"] = sel
+
+    # cargar datos del tenant
+    row = clientes_df[clientes_df["tenant_id"] == CURRENT_TENANT_ID].iloc[0]
     CURRENT_SHEET_ID   = row.get("sheet_id", DEFAULT_SHEET_ID)
     KAME_CLIENT_ID     = row.get("kame_client_id", "")
     KAME_CLIENT_SECRET = row.get("kame_client_secret", "")
@@ -307,18 +360,27 @@ if clientes_df is not None and len(clientes_df):
 else:
     st.sidebar.selectbox("Cliente", ["(sin clientes_config)"])
 
+# ahora sí: leemos URLs de ese sheet
+urls_cfg = load_global_urls(CURRENT_SHEET_ID)
+report_url_from_sheet = urls_cfg.get("reporteria_url", "").strip()
+
+target_report_url = report_url_from_sheet or REPORT_APP_URL
+if CURRENT_TENANT_ID:
+    sep = "&" if "?" in target_report_url else "?"
+    target_report_url = f"{target_report_url}{sep}tenant={CURRENT_TENANT_ID}"
+
 # --- navegación lateral ---
 st.sidebar.markdown("### Navegación")
-st.sidebar.markdown(
-    f"[📊 Reportería de ventas]({REPORT_APP_URL}?tenant={CURRENT_TENANT_ID})"
-)
+st.sidebar.markdown(f"[📊 Reportería de ventas]({target_report_url})")
 st.sidebar.markdown("---")
 
 modo_datos = "ONLINE (KAME ERP)" if not OFFLINE else "OFFLINE (CSV)"
 st.title("🧠 Predictor de Compras ↪")
 st.caption(f"Fuente de datos: **{modo_datos}** — Tenant: **{CURRENT_TENANT_ID}**")
 
-# Botones (3)
+# --------------------------------------
+# BOTONES SUPERIORES
+# --------------------------------------
 bt1, bt2, bt3 = st.columns(3)
 with bt1:
     if st.button("📘 Actualizar ventas (S1)", use_container_width=True):
@@ -357,7 +419,6 @@ with st.expander("Opciones avanzadas (Make / Debug)"):
 
 # botón principal
 if st.button("Ejecutar predicción", type="primary", use_container_width=True):
-    # opcional: disparar escenarios
     if disparar:
         st.info("Disparando S1/S2/S3…")
         st.write("S1:", trigger_make(MAKE_WEBHOOK_S1_URL, {"reason": "ui_run", "tenant_id": CURRENT_TENANT_ID}))
@@ -395,11 +456,9 @@ if st.button("Ejecutar predicción", type="primary", use_container_width=True):
 
     inbound_core = prepare_inbound_for_core(inbound)
 
-    # ========================
-    # PANEL RESUMEN ARRIBA
-    # ========================
+    # panel resumen
     sku_mostrar = sku_q.upper() if sku_q else "(varios)"
-    stock_env = float(stock_total["stock"].sum()) if not stock_total.empty else 0
+    stock_env   = float(stock_total["stock"].sum()) if not stock_total.empty else 0
     inbound_env = int(inbound_core["qty"].sum()) if not inbound_core.empty else 0
 
     colm1, colm2, colm3, colm4 = st.columns(4)
@@ -408,9 +467,7 @@ if st.button("Ejecutar predicción", type="primary", use_container_width=True):
     colm3.metric("Inbound detectado", inbound_env)
     placeholder_propuesta = colm4.empty()
 
-    # ========================
-    # SECCIÓN TÉCNICA EN EXPANDERS
-    # ========================
+    # secciones técnicas
     with st.expander("Estado de los Servicios 📄", expanded=False):
         st.write(f"Ventas: {'✅ OK' if not ventas_raw.empty else '⚠️ Vacío'}")
         st.write(f"Stock (stock_snapshot): {'✅ OK' if not stock_raw.empty else '⚠️ Vacío'}")
@@ -440,9 +497,7 @@ if st.button("Ejecutar predicción", type="primary", use_container_width=True):
             st.code(list(config.columns), language="python")
             st.dataframe(config.head(), use_container_width=True)
 
-    # ========================
-    # SI NO HAY VENTAS → avisar
-    # ========================
+    # si no hay ventas
     if ventas.empty:
         st.warning("No hay ventas para los filtros dados.")
     else:
@@ -491,6 +546,8 @@ if st.button("Ejecutar predicción", type="primary", use_container_width=True):
             "pred_detalle.csv",
             "text/csv",
         )
+
+
 
 
 

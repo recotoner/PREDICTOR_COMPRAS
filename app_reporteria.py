@@ -17,9 +17,61 @@ TAB_STOCK          = "stock_snapshot"
 TAB_CLIENTES_CONF  = "clientes_config"
 
 # URL de la otra app (predictor) para navegar
-PREDICTOR_APP_URL = "https://predictor-compras.onrender.com/"
+PREDICTOR_APP_URL = "http://localhost:8503"
 
 st.set_page_config(page_title="Reportería de Ventas", layout="wide")
+
+# ============================
+# COSMÉTICA (igual que predictor)
+# ============================
+st.markdown(
+    """
+    <style>
+    /* sidebar oscuro */
+    [data-testid="stSidebar"] {
+        background-color: #0f172a !important;
+    }
+    /* select del sidebar sobre oscuro */
+    [data-testid="stSidebar"] .stSelectbox > div > div {
+        background-color: #0f172a !important;
+        border: 1px solid rgba(255, 255, 255, 0.25) !important;
+        color: #ffffff !important;
+        border-radius: 8px !important;
+    }
+    [data-testid="stSidebar"] .stSelectbox label,
+    [data-testid="stSidebar"] p {
+        color: #ffffff !important;
+    }
+    [data-testid="stSidebar"] .stSelectbox svg {
+        color: #ffffff !important;
+    }
+
+    /* inputs del cuerpo un poco más marcados */
+    .stTextInput > div > div,
+    .stSelectbox:not([data-testid="stSidebar"] .stSelectbox) > div > div,
+    .stSlider > div > div {
+        border: 1px solid rgba(15, 23, 42, 0.12) !important;
+        border-radius: 10px !important;
+    }
+
+    /* expanders más redondeados */
+    details {
+        border-radius: 10px !important;
+    }
+
+    /* tablas un poquito separadas */
+    .stDataFrame {
+        border-radius: 12px !important;
+    }
+
+    /* títulos más juntitos al estilo predictor */
+    h1, h2, h3 {
+        letter-spacing: -0.02rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 # ============================
 # HELPERS
@@ -103,7 +155,7 @@ st.sidebar.markdown("---")
 # ============================
 # UI PRINCIPAL
 # ============================
-st.title("📊 Reportería de Ventas y Stock ↩")
+st.title("📊 REPORTES DE VENTAS Y STOCK ↩")
 st.caption(f"Tenant: **{CURRENT_TENANT_ID}**")
 
 with st.expander("Detalles técnicos (oculto para gerencia)", expanded=False):
@@ -217,20 +269,12 @@ m1 = ventas_m1.groupby("sku")["qty"].sum().rename("qty_cur").reset_index()
 m2 = ventas_m2.groupby("sku")["qty"].sum().rename("qty_prev").reset_index()
 
 alzabaja = pd.merge(m1, m2, on="sku", how="outer").fillna(0)
-# quitar filas totalmente en cero
-alzabaja = alzabaja[(alzabaja["qty_cur"] != 0) | (alzabaja["qty_prev"] != 0)]
+alzabaja["delta"] = alzabaja["qty_cur"] - alzabaja["qty_prev"]
 
 col_1, col_2 = st.columns(2)
 
 with col_1:
     st.markdown("✅ **En alza**")
-    en_alza = alzabaja[alzabaja["delta"] if "delta" in alzabaja.columns else (alzabaja["qty_cur"] - alzabaja["qty_prev"]) > 0]
-# ups, mejor hacerlo claro:
-
-# recalculamos delta de forma explícita
-alzabaja["delta"] = alzabaja["qty_cur"] - alzabaja["qty_prev"]
-
-with col_1:
     en_alza = alzabaja[alzabaja["delta"] > 0].sort_values("delta", ascending=False)
     if en_alza.empty:
         st.info("No hay productos en alza para el período.")
