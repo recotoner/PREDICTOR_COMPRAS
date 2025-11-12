@@ -17,7 +17,7 @@ TAB_STOCK          = "stock_snapshot"
 TAB_CLIENTES_CONF  = "clientes_config"
 
 # URL de la otra app (predictor) para navegar
-PREDICTOR_APP_URL = "http://localhost:8503"
+PREDICTOR_APP_URL = "https://predictor-compras.onrender.com/"
 
 st.set_page_config(page_title="Reportería de Ventas", layout="wide")
 
@@ -332,6 +332,7 @@ else:
             use_container_width=True,
             hide_index=True,
         )
+
 
 
 
