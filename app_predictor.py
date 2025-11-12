@@ -30,8 +30,8 @@ DEFAULT_MAKE_WEBHOOK_S2_URL = "https://hook.us1.make.com/vdj87rfcjpmeuccds9vieu4
 DEFAULT_MAKE_WEBHOOK_S3_URL = "https://hook.us1.make.com/k50t6u1rtrswqd6vl4s8mqf2ndu6noa3"
 
 # URLs de otras apps (para navegación)
-REPORT_APP_URL = "https://reporteria-compras.onrender.com
-"   # cámbiala en server
+REPORT_APP_URL = "https://reporteria-compras.onrender.com"
+# cámbiala en server
 
 # ======================================
 # STREAMLIT BASE
