@@ -32,6 +32,11 @@ DEFAULT_MAKE_WEBHOOK_S3_URL = "https://hook.us1.make.com/k50t6u1rtrswqd6vl4s8mqf
 # URL de reportería (respaldo; la real se lee del sheet del tenant)
 REPORT_APP_URL = "http://localhost:8504"
 
+# HENRY: tiempos de espera recomendados después de S1/S2/S3 (en segundos)
+COOLDOWN_S1 = 60   # ventas
+COOLDOWN_S2 = 90   # stock total
+COOLDOWN_S3 = 30   # inbound
+
 # ======================================
 # STREAMLIT BASE
 # ======================================
@@ -326,6 +331,15 @@ def trigger_make(url: str, payload: dict) -> dict:
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+# HENRY: helper para manejar el cooldown del botón de predicción
+def start_cooldown(seconds: int):
+    """Marca en sesión un tiempo mínimo antes de ejecutar la predicción."""
+    if seconds <= 0:
+        return
+    now_ts = time.time()
+    current = st.session_state.get("cooldown_until", 0)
+    st.session_state["cooldown_until"] = max(current, now_ts + seconds)
+
 # ======================================
 # CARGA CONFIG CLIENTES
 # ======================================
@@ -335,8 +349,9 @@ if clientes_df is not None and not clientes_df.empty:
 
 # Botón Salir SIEMPRE visible (limpia sesión)
 if st.sidebar.button("Salir", type="secondary", use_container_width=True):
-    for k in ["TENANT_NAME","TENANT_ID","TENANT_ROW"]:
-        if k in st.session_state: del st.session_state[k]
+    for k in ["TENANT_NAME","TENANT_ID","TENANT_ROW","cooldown_until","batch_scenarios_disparados"]:
+        if k in st.session_state:
+            del st.session_state[k]
     st.rerun()
 
 # ======================================
@@ -437,15 +452,30 @@ st.caption(f"Fuente de datos: **{modo_datos}** — Tenant: **{TENANT_NAME}**")
 bt1, bt2, bt3 = st.columns(3)
 with bt1:
     if st.button("📘 Actualizar ventas (S1)", use_container_width=True):
-        st.json(trigger_make(MAKE_WEBHOOK_S1_URL, {"reason": "ui_run", "tenant_id": TENANT_ID}))
+        resp = trigger_make(MAKE_WEBHOOK_S1_URL, {"reason": "ui_run", "tenant_id": TENANT_ID})
+        if resp.get("ok"):
+            st.success("Actualización de ventas enviada a Make. Espera ~60 segundos antes de ejecutar la predicción.")
+            start_cooldown(COOLDOWN_S1)
+        else:
+            st.error(f"No se pudo actualizar ventas (S1). Código: {resp.get('status')}, detalle: {resp.get('error') or resp.get('text')}")
 with bt2:
     if st.button("📦 Actualizar stock total (S2)", use_container_width=True):
-        st.json(trigger_make(MAKE_WEBHOOK_S2_URL, {
+        resp = trigger_make(MAKE_WEBHOOK_S2_URL, {
             "reason": "ui_run", "tenant_id": TENANT_ID, "use_stock_total": True
-        }))
+        })
+        if resp.get("ok"):
+            st.success("Actualización de stock total enviada. Espera ~90 segundos antes de ejecutar la predicción.")
+            start_cooldown(COOLDOWN_S2)
+        else:
+            st.error(f"No se pudo actualizar stock (S2). Código: {resp.get('status')}, detalle: {resp.get('error') or resp.get('text')}")
 with bt3:
     if st.button("🧾 Actualizar inbound (S3)", use_container_width=True):
-        st.json(trigger_make(MAKE_WEBHOOK_S3_URL, {"reason": "ui_run", "tenant_id": TENANT_ID}))
+        resp = trigger_make(MAKE_WEBHOOK_S3_URL, {"reason": "ui_run", "tenant_id": TENANT_ID})
+        if resp.get("ok"):
+            st.success("Actualización de inbound enviada. Espera ~30 segundos antes de ejecutar la predicción.")
+            start_cooldown(COOLDOWN_S3)
+        else:
+            st.error(f"No se pudo actualizar inbound (S3). Código: {resp.get('status')}, detalle: {resp.get('error') or resp.get('text')}")
 
 st.markdown("")
 
@@ -463,15 +493,63 @@ with st.expander("Opciones avanzadas (Make / Debug)"):
     mostrar_inbound = st.checkbox("Mostrar inbound agrupado", value=True)
     mostrar_stocks  = st.checkbox("Mostrar stocks (informativos)", value=True)
 
-# botón principal
-if st.button("Ejecutar predicción", type="primary", use_container_width=True):
-    if disparar:
-        st.info("Disparando S1/S2/S3…")
-        st.write("S1:", trigger_make(MAKE_WEBHOOK_S1_URL, {"reason": "ui_run", "tenant_id": TENANT_ID}))
-        st.write("S2:", trigger_make(MAKE_WEBHOOK_S2_URL, {"reason": "ui_run", "tenant_id": TENANT_ID, "use_stock_total": True}))
-        st.write("S3:", trigger_make(MAKE_WEBHOOK_S3_URL, {"reason": "ui_run", "tenant_id": TENANT_ID}))
-        st.write("Esperando 5s para que Make actualice las hojas…")
-        time.sleep(5)
+# --------------------------------------
+# BOTÓN PRINCIPAL (con cooldown)
+# --------------------------------------
+now_ts = time.time()
+cooldown_until = st.session_state.get("cooldown_until", 0)
+remaining = max(0, int(cooldown_until - now_ts))
+
+# HENRY: placeholder para mostrar un contador en vivo
+cooldown_placeholder = st.empty()
+
+if remaining > 0:
+    # Contador regresivo en vivo (máx 90s según los COOLDOWN_* que definimos)
+    for sec in range(remaining, 0, -1):
+        cooldown_placeholder.warning(
+            f"Se están actualizando datos desde KAME/Make. "
+            f"Espera aproximadamente {sec} segundos antes de ejecutar la predicción."
+        )
+        time.sleep(1)
+    # Al terminar el contador limpiamos estado y mensaje
+    cooldown_placeholder.empty()
+    st.session_state["cooldown_until"] = 0
+    remaining = 0
+
+# Si ya no hay espera pendiente, el botón queda habilitado
+if remaining > 0:
+    main_label = f"Ejecutar predicción (espera {remaining}s)"
+    main_disabled = True
+else:
+    main_label = "Ejecutar predicción"
+    main_disabled = False
+
+if st.button(main_label, type="primary", use_container_width=True, disabled=main_disabled):
+    # HENRY: modo "disparar S1/S2/S3 antes de predecir"
+    if disparar and not st.session_state.get("batch_scenarios_disparados", False):
+        st.info("Disparando S1 (ventas), S2 (stock total) y S3 (inbound) desde la app…")
+
+        s1 = trigger_make(MAKE_WEBHOOK_S1_URL, {"reason": "ui_run", "tenant_id": TENANT_ID})
+        s2 = trigger_make(MAKE_WEBHOOK_S2_URL, {
+            "reason": "ui_run", "tenant_id": TENANT_ID, "use_stock_total": True
+        })
+        s3 = trigger_make(MAKE_WEBHOOK_S3_URL, {"reason": "ui_run", "tenant_id": TENANT_ID})
+
+        if s1.get("ok") and s2.get("ok") and s3.get("ok"):
+            # un solo cooldown largo para los tres (usa los mismos tiempos definidos arriba)
+            start_cooldown(max(COOLDOWN_S1, COOLDOWN_S2, COOLDOWN_S3))
+            st.session_state["batch_scenarios_disparados"] = True
+        else:
+            st.error(
+                "Alguno de los escenarios S1/S2/S3 devolvió error. "
+                "Revisa el escenario en Make antes de ejecutar la predicción."
+            )
+        st.rerun()  # volvemos a correr el script para que aparezca el contador
+
+
+    # Si llegamos aquí:
+    # - disparar == False  → predicción normal
+    # - disparar == True y batch_scenarios_disparados == True → ya esperamos el cooldown, ahora sí predecimos
 
     # leer datos
     with st.spinner("Leyendo datos de Sheets…"):
@@ -557,6 +635,10 @@ if st.button("Ejecutar predicción", type="primary", use_container_width=True):
 
         st.success("Listo ✅")
 
+        # al terminar una corrida correcta, limpiamos el cooldown y el batch
+        st.session_state["cooldown_until"] = 0
+        st.session_state["batch_scenarios_disparados"] = False
+
         if not prop.empty:
             total_prop = int(prop["qty_sugerida"].sum())
             placeholder_propuesta.metric("Propuesta sugerida", total_prop)
@@ -589,6 +671,8 @@ if st.button("Ejecutar predicción", type="primary", use_container_width=True):
             "pred_detalle.csv",
             "text/csv",
         )
+
+
 
 
 
