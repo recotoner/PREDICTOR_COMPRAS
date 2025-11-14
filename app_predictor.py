@@ -156,7 +156,7 @@ def read_gsheets(sheet_id: str, tab: str) -> pd.DataFrame:
            f"tqx=out:csv&sheet={sheet_param}")
     return pd.read_csv(url)
 
-@st.cache_data
+@st.cache_data(ttl=300)
 def load_clientes_config() -> Optional[pd.DataFrame]:
     """Intenta leer la pestaña clientes_config del sheet por defecto."""
     try:
@@ -166,7 +166,7 @@ def load_clientes_config() -> Optional[pd.DataFrame]:
     except Exception:
         return None
 
-@st.cache_data
+@st.cache_data(ttl=300)
 def load_global_urls(sheet_id: str) -> dict:
     """Lee la hoja config y devuelve predictor_url y reporteria_url (fila 1)."""
     try:
@@ -671,6 +671,7 @@ if st.button(main_label, type="primary", use_container_width=True, disabled=main
             "pred_detalle.csv",
             "text/csv",
         )
+
 
 
 
