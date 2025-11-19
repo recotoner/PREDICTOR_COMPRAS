@@ -7,7 +7,13 @@ import pandas as pd
 import streamlit as st
 from urllib.parse import quote
 from typing import Optional
-from predictor_core import forecast_all  # tu core
+from predictor_core import forecast_all  # tu core de COMPRAS
+
+# Nuevo: core de VENTAS (monto $)
+try:
+    from predictor_sales_core import forecast_sales
+except ImportError:
+    forecast_sales = None
 
 # ======================================
 # CONFIG / MODOS
@@ -101,28 +107,61 @@ def ensure_clientes_columns(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     d = df.copy()
     d.columns = [str(c).replace("\u00a0"," ").strip() for c in d.columns]
+
     if "tenant_name" not in d.columns and "tenant" in d.columns:
         d = d.rename(columns={"tenant": "tenant_name"})
     if "is_active" not in d.columns and "activo" in d.columns:
         d["is_active"] = d["activo"]
+
+    # columnas requeridas, incluyendo mod_compras / mod_ventas
     for col in [
         "tenant_id","tenant_name","sheet_id",
         "webhook_s1","webhook_s2","webhook_s3",
         "kame_client_id","kame_client_secret",
-        "use_stock_total","login_email","login_pin","is_active"
+        "use_stock_total","login_email","login_pin","is_active",
+        "mod_compras","mod_ventas",
     ]:
         if col not in d.columns:
-            d[col] = "" if col not in ("use_stock_total","is_active") else True
-    for col in ["tenant_id","tenant_name","sheet_id","webhook_s1","webhook_s2","webhook_s3",
-                "kame_client_id","kame_client_secret","login_email","login_pin"]:
+            if col in ("use_stock_total", "is_active"):
+                d[col] = True
+            elif col == "mod_compras":
+                # por defecto: módulo Compras habilitado
+                d[col] = True
+            elif col == "mod_ventas":
+                # por defecto: módulo Ventas deshabilitado
+                d[col] = False
+            else:
+                d[col] = ""
+
+    # normalizamos columnas string
+    for col in [
+        "tenant_id","tenant_name","sheet_id",
+        "webhook_s1","webhook_s2","webhook_s3",
+        "kame_client_id","kame_client_secret",
+        "login_email","login_pin",
+    ]:
         if col in d.columns:
             d[col] = d[col].astype(str).map(_clean)
+
     if "login_email" in d.columns:
         d["login_email"] = d["login_email"].str.lower()
-    d["is_active"] = d["is_active"].apply(_truthy)
-    d["use_stock_total"] = d["use_stock_total"].apply(_truthy)
+
     d["tenant_name"] = d["tenant_name"].replace({pd.NA:"", None:""}).astype(str)
     d.loc[d["tenant_id"].eq("") | d["tenant_id"].isna(), "tenant_id"] = d["tenant_name"].apply(slugify)
+
+    # booleanos base
+    d["is_active"] = d["is_active"].apply(_truthy)
+    d["use_stock_total"] = d["use_stock_total"].apply(_truthy)
+
+    # mod_compras: vacío => True; texto truthy => True; otro => False
+    raw_mc = d["mod_compras"].astype(str).replace("\u00a0", " ").str.strip()
+    d["mod_compras"] = raw_mc.apply(lambda x: True if x == "" else _truthy(x))
+
+    # mod_ventas: vacío => False; texto truthy => True; otro => False
+    raw_mv = d["mod_ventas"].astype(str).replace("\u00a0", " ").str.strip()
+    d["mod_ventas"] = raw_mv.apply(lambda x: False if x == "" else _truthy(x))
+
+    d["tenant_name"] = d["tenant_name"].astype(str)
     return d
 
 def auth_tenant_row(cfg_df: pd.DataFrame, tenant_key: str, email: str, pin: str) -> Optional[pd.Series]:
@@ -201,6 +240,82 @@ def normalize_ventas_sheet(df: pd.DataFrame) -> pd.DataFrame:
     out["qty"]   = pd.to_numeric(df[qty_col], errors="coerce").fillna(0)
     out = out.dropna(subset=["fecha", "sku"])
     return out
+
+# === NUEVO: normalizador extendido para Módulo Ventas ===
+def normalize_ventas_for_sales(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalizador extendido para el Módulo de Ventas.
+    NO se usa en el core de Compras, por lo que no altera el comportamiento actual.
+    """
+    base_cols = [
+        "fecha", "sku", "qty", "venta_neta", "precio_unitario",
+        "rut", "razon_social", "tipo_documento", "folio", "glosa",
+        "sucursal", "unidad_negocio", "familia", "vendedor",
+        "lista_precio", "producto",
+    ]
+
+    if df is None or df.empty:
+        return pd.DataFrame(columns=base_cols)
+
+    cols_lc = {str(c).lower(): c for c in df.columns}
+
+    def _col(*candidates):
+        for key in candidates:
+            key_lc = key.lower()
+            if key_lc in cols_lc:
+                return cols_lc[key_lc]
+        return None
+
+    fecha_col = _col("fecha")
+    sku_col   = _col("sku", "sku2")
+    qty_col   = _col("cantidad", "qty", "unidades")
+    # monto de la línea: intentamos varios nombres
+    venta_col = _col("venta_neta", "total_linea", "total línea", "total_line")
+
+    if not fecha_col or not sku_col or not qty_col:
+        # si faltan columnas mínimas, devolvemos un DF vacío "bien formado"
+        return pd.DataFrame(columns=base_cols)
+
+    out = pd.DataFrame()
+    out["fecha"] = pd.to_datetime(df[fecha_col], errors="coerce")
+    out["sku"]   = df[sku_col].astype(str).str.strip().str.upper()
+    out["qty"]   = pd.to_numeric(df[qty_col], errors="coerce").fillna(0)
+
+    if venta_col:
+        out["venta_neta"] = pd.to_numeric(df[venta_col], errors="coerce").fillna(0.0)
+    else:
+        out["venta_neta"] = 0.0
+
+    precio_col = _col("precio_unitario", "precio un.", "precio_un", "precio unitario")
+    if precio_col:
+        out["precio_unitario"] = pd.to_numeric(df[precio_col], errors="coerce").fillna(0.0)
+    else:
+        out["precio_unitario"] = 0.0
+
+    text_map = {
+        "rut": ["rut"],
+        "razon_social": ["razon_social", "razón social"],
+        "tipo_documento": ["tipo_documento", "documento"],
+        "folio": ["folio"],
+        "glosa": ["glosa"],
+        "sucursal": ["sucursal"],
+        "unidad_negocio": ["unidad_negocio", "unidad de negocio"],
+        "familia": ["familia"],
+        "vendedor": ["vendedor"],
+        "lista_precio": ["lista_precio", "lista precio"],
+        "producto": ["producto", "descripcion", "descripción"],
+    }
+
+    for logical, candidates in text_map.items():
+        c = _col(*candidates)
+        if c:
+            out[logical] = df[c].astype(str).fillna("").str.strip()
+        else:
+            out[logical] = ""
+
+    out = out.dropna(subset=["fecha", "sku"])
+    return out
+# === FIN normalizador ventas ===
 
 def _guess_sku_col(df: pd.DataFrame) -> str:
     prefer = ["sku", "SKU", "codigo", "producto", "Producto"]
@@ -320,6 +435,8 @@ def prepare_inbound_for_core(inbound: pd.DataFrame) -> pd.DataFrame:
     return df_grp
 
 # ======================================
+# HELPERS PARA GRÁFICOS
+# ======================================
 # UTIL WEBHOOK
 # ======================================
 def trigger_make(url: str, payload: dict) -> dict:
@@ -349,7 +466,11 @@ if clientes_df is not None and not clientes_df.empty:
 
 # Botón Salir SIEMPRE visible (limpia sesión)
 if st.sidebar.button("Salir", type="secondary", use_container_width=True):
-    for k in ["TENANT_NAME","TENANT_ID","TENANT_ROW","cooldown_until","batch_scenarios_disparados"]:
+    for k in [
+        "TENANT_NAME","TENANT_ID","TENANT_ROW",
+        "cooldown_until","batch_scenarios_disparados",
+        "MODULO_ACTIVO",
+    ]:
         if k in st.session_state:
             del st.session_state[k]
     st.rerun()
@@ -424,6 +545,10 @@ KAME_CLIENT_ID     = TENANT_ROW.get("kame_client_id", "")
 KAME_CLIENT_SECRET = TENANT_ROW.get("kame_client_secret", "")
 USE_STOCK_TOTAL    = _truthy(TENANT_ROW.get("use_stock_total", False)) if TENANT_ROW else False
 
+# Flags de módulos (Compras / Ventas) leídos desde clientes_config
+MOD_COMPRAS = bool(TENANT_ROW.get("mod_compras", True)) if TENANT_ROW else True
+MOD_VENTAS  = bool(TENANT_ROW.get("mod_ventas", False)) if TENANT_ROW else False
+
 MAKE_WEBHOOK_S1_URL = TENANT_ROW.get("webhook_s1", DEFAULT_MAKE_WEBHOOK_S1_URL)
 MAKE_WEBHOOK_S2_URL = TENANT_ROW.get("webhook_s2", DEFAULT_MAKE_WEBHOOK_S2_URL)
 MAKE_WEBHOOK_S3_URL = TENANT_ROW.get("webhook_s3", DEFAULT_MAKE_WEBHOOK_S3_URL)
@@ -436,241 +561,638 @@ if TENANT_ID:
     sep = "&" if "?" in target_report_url else "?"
     target_report_url = f"{target_report_url}{sep}tenant={TENANT_ID}"
 
+# Módulos disponibles según clientes_config
+module_options = []
+if MOD_COMPRAS:
+    module_options.append("Compras")
+if MOD_VENTAS:
+    module_options.append("Ventas")
+if not module_options:
+    module_options = ["Compras"]
+
+if "MODULO_ACTIVO" not in st.session_state or st.session_state["MODULO_ACTIVO"] not in module_options:
+    st.session_state["MODULO_ACTIVO"] = module_options[0]
+
 # --- navegación lateral ---
 st.sidebar.markdown("### Navegación")
-st.sidebar.markdown(f"""<a href="{target_report_url}" target="_blank">📊 Reportería de ventas</a>""",
-                    unsafe_allow_html=True)
+st.sidebar.markdown(
+    f"""<a href="{target_report_url}" target="_blank">📊 Reportería de ventas</a>""",
+    unsafe_allow_html=True,
+)
 st.sidebar.markdown("---")
 
+st.sidebar.markdown("### Módulo")
+modulo_activo = st.sidebar.radio(
+    "Selecciona el módulo",
+    module_options,
+    index=module_options.index(st.session_state["MODULO_ACTIVO"])
+)
+st.session_state["MODULO_ACTIVO"] = modulo_activo
+
 modo_datos = "ONLINE (KAME ERP)" if not OFFLINE else "OFFLINE (CSV)"
-st.title("🧠 Predictor de Compras ↪")
-st.caption(f"Fuente de datos: **{modo_datos}** — Tenant: **{TENANT_NAME}**")
 
-# --------------------------------------
-# BOTONES SUPERIORES
-# --------------------------------------
-bt1, bt2, bt3 = st.columns(3)
-with bt1:
-    if st.button("📘 Actualizar ventas (S1)", use_container_width=True):
-        resp = trigger_make(MAKE_WEBHOOK_S1_URL, {"reason": "ui_run", "tenant_id": TENANT_ID})
-        if resp.get("ok"):
-            st.success("Actualización de ventas enviada a Make. Espera ~60 segundos antes de ejecutar la predicción.")
-            start_cooldown(COOLDOWN_S1)
-        else:
-            st.error(f"No se pudo actualizar ventas (S1). Código: {resp.get('status')}, detalle: {resp.get('error') or resp.get('text')}")
-with bt2:
-    if st.button("📦 Actualizar stock total (S2)", use_container_width=True):
-        resp = trigger_make(MAKE_WEBHOOK_S2_URL, {
-            "reason": "ui_run", "tenant_id": TENANT_ID, "use_stock_total": True
-        })
-        if resp.get("ok"):
-            st.success("Actualización de stock total enviada. Espera ~90 segundos antes de ejecutar la predicción.")
-            start_cooldown(COOLDOWN_S2)
-        else:
-            st.error(f"No se pudo actualizar stock (S2). Código: {resp.get('status')}, detalle: {resp.get('error') or resp.get('text')}")
-with bt3:
-    if st.button("🧾 Actualizar inbound (S3)", use_container_width=True):
-        resp = trigger_make(MAKE_WEBHOOK_S3_URL, {"reason": "ui_run", "tenant_id": TENANT_ID})
-        if resp.get("ok"):
-            st.success("Actualización de inbound enviada. Espera ~30 segundos antes de ejecutar la predicción.")
-            start_cooldown(COOLDOWN_S3)
-        else:
-            st.error(f"No se pudo actualizar inbound (S3). Código: {resp.get('status')}, detalle: {resp.get('error') or resp.get('text')}")
+# ======================================
+# MÓDULO COMPRAS (ACTUAL)
+# ======================================
+if modulo_activo == "Compras":
+    st.title("🧠 Predictor de Compras ↪")
+    st.caption(f"Fuente de datos: **{modo_datos}** — Tenant: **{TENANT_NAME}**")
 
-st.markdown("")
-
-# filtros
-colA, colB, colC = st.columns(3)
-freq    = colA.selectbox("Frecuencia", ["Mensual (M)", "Semanal (W)"], index=0)
-horizon = colB.slider("Horizonte (períodos)", 2, 24, 6, 1)
-modo    = colC.selectbox("Modo", ["Global", "Por SKU"], index=1)
-sku_q   = st.text_input("SKU (opcional)") if modo == "Por SKU" else None
-
-# opciones avanzadas
-with st.expander("Opciones avanzadas (Make / Debug)"):
-    disparar        = st.checkbox("Disparar S1/S2/S3 antes de predecir", value=False)
-    mostrar_debug   = st.checkbox("Mostrar debug de columnas/valores config", value=False)
-    mostrar_inbound = st.checkbox("Mostrar inbound agrupado", value=True)
-    mostrar_stocks  = st.checkbox("Mostrar stocks (informativos)", value=True)
-
-# --------------------------------------
-# BOTÓN PRINCIPAL (con cooldown)
-# --------------------------------------
-now_ts = time.time()
-cooldown_until = st.session_state.get("cooldown_until", 0)
-remaining = max(0, int(cooldown_until - now_ts))
-
-# HENRY: placeholder para mostrar un contador en vivo
-cooldown_placeholder = st.empty()
-
-if remaining > 0:
-    # Contador regresivo en vivo (máx 90s según los COOLDOWN_* que definimos)
-    for sec in range(remaining, 0, -1):
-        cooldown_placeholder.warning(
-            f"Se están actualizando datos desde KAME/Make. "
-            f"Espera aproximadamente {sec} segundos antes de ejecutar la predicción."
-        )
-        time.sleep(1)
-    # Al terminar el contador limpiamos estado y mensaje
-    cooldown_placeholder.empty()
-    st.session_state["cooldown_until"] = 0
-    remaining = 0
-
-# Si ya no hay espera pendiente, el botón queda habilitado
-if remaining > 0:
-    main_label = f"Ejecutar predicción (espera {remaining}s)"
-    main_disabled = True
-else:
-    main_label = "Ejecutar predicción"
-    main_disabled = False
-
-if st.button(main_label, type="primary", use_container_width=True, disabled=main_disabled):
-    # HENRY: modo "disparar S1/S2/S3 antes de predecir"
-    if disparar and not st.session_state.get("batch_scenarios_disparados", False):
-        st.info("Disparando S1 (ventas), S2 (stock total) y S3 (inbound) desde la app…")
-
-        s1 = trigger_make(MAKE_WEBHOOK_S1_URL, {"reason": "ui_run", "tenant_id": TENANT_ID})
-        s2 = trigger_make(MAKE_WEBHOOK_S2_URL, {
-            "reason": "ui_run", "tenant_id": TENANT_ID, "use_stock_total": True
-        })
-        s3 = trigger_make(MAKE_WEBHOOK_S3_URL, {"reason": "ui_run", "tenant_id": TENANT_ID})
-
-        if s1.get("ok") and s2.get("ok") and s3.get("ok"):
-            # un solo cooldown largo para los tres (usa los mismos tiempos definidos arriba)
-            start_cooldown(max(COOLDOWN_S1, COOLDOWN_S2, COOLDOWN_S3))
-            st.session_state["batch_scenarios_disparados"] = True
-        else:
-            st.error(
-                "Alguno de los escenarios S1/S2/S3 devolvió error. "
-                "Revisa el escenario en Make antes de ejecutar la predicción."
+    # --------------------------------------
+    # BOTONES SUPERIORES
+    # --------------------------------------
+    bt1, bt2, bt3 = st.columns(3)
+    with bt1:
+        if st.button("📘 Actualizar ventas (S1)", use_container_width=True):
+            resp = trigger_make(MAKE_WEBHOOK_S1_URL, {"reason": "ui_run", "tenant_id": TENANT_ID})
+            if resp.get("ok"):
+                st.success("Actualización de ventas enviada a Make. Espera ~60 segundos antes de ejecutar la predicción.")
+                start_cooldown(COOLDOWN_S1)
+            else:
+                st.error(
+                    f"No se pudo actualizar ventas (S1). "
+                    f"Código: {resp.get('status')}, detalle: {resp.get('error') or resp.get('text')}"
+                )
+    with bt2:
+        if st.button("📦 Actualizar stock total (S2)", use_container_width=True):
+            resp = trigger_make(
+                MAKE_WEBHOOK_S2_URL,
+                {"reason": "ui_run", "tenant_id": TENANT_ID, "use_stock_total": True},
             )
-        st.rerun()  # volvemos a correr el script para que aparezca el contador
+            if resp.get("ok"):
+                st.success("Actualización de stock total enviada. Espera ~90 segundos antes de ejecutar la predicción.")
+                start_cooldown(COOLDOWN_S2)
+            else:
+                st.error(
+                    f"No se pudo actualizar stock (S2). "
+                    f"Código: {resp.get('status')}, detalle: {resp.get('error') or resp.get('text')}"
+                )
+    with bt3:
+        if st.button("🧾 Actualizar inbound (S3)", use_container_width=True):
+            resp = trigger_make(MAKE_WEBHOOK_S3_URL, {"reason": "ui_run", "tenant_id": TENANT_ID})
+            if resp.get("ok"):
+                st.success("Actualización de inbound enviada. Espera ~30 segundos antes de ejecutar la predicción.")
+                start_cooldown(COOLDOWN_S3)
+            else:
+                st.error(
+                    f"No se pudo actualizar inbound (S3). "
+                    f"Código: {resp.get('status')}, detalle: {resp.get('error') or resp.get('text')}"
+                )
 
+    st.markdown("")
 
-    # Si llegamos aquí:
-    # - disparar == False  → predicción normal
-    # - disparar == True y batch_scenarios_disparados == True → ya esperamos el cooldown, ahora sí predecimos
+    # filtros
+    colA, colB, colC = st.columns(3)
+    freq    = colA.selectbox("Frecuencia", ["Mensual (M)", "Semanal (W)"], index=0)
+    horizon = colB.slider("Horizonte (períodos)", 2, 24, 6, 1)
+    modo    = colC.selectbox("Modo", ["Global", "Por SKU"], index=1)
+    sku_q   = st.text_input("SKU (opcional)") if modo == "Por SKU" else None
 
-    # leer datos
-    with st.spinner("Leyendo datos de Sheets…"):
-        ventas_raw   = read_gsheets(CURRENT_SHEET_ID, TAB_VENTAS)
-        stock_raw    = read_gsheets(CURRENT_SHEET_ID, TAB_STOCK)
-        stock_tr_raw = read_gsheets(CURRENT_SHEET_ID, TAB_STOCK_TRANS)
-        config_raw   = read_gsheets(CURRENT_SHEET_ID, TAB_CONFIG)
-        inbound_raw  = read_gsheets(CURRENT_SHEET_ID, TAB_INBOUND)
+    # opciones avanzadas
+    with st.expander("Opciones avanzadas (Make / Debug)"):
+        disparar        = st.checkbox("Disparar S1/S2/S3 antes de predecir", value=False)
+        mostrar_debug   = st.checkbox("Mostrar debug de columnas/valores config", value=False)
+        mostrar_inbound = st.checkbox("Mostrar inbound agrupado", value=True)
+        mostrar_stocks  = st.checkbox("Mostrar stocks (informativos)", value=True)
 
-        ventas  = normalize_ventas_sheet(ventas_raw)
-        stock_p = normalize_stock_sheet(stock_raw)
-        stock_t = normalize_stock_sheet(stock_tr_raw)
-        config  = normalize_config_sheet(config_raw, ventas, stock_p)
-        inbound = normalize_inbound_sheet(inbound_raw)
+    # --------------------------------------
+    # BOTÓN PRINCIPAL (con cooldown)
+    # --------------------------------------
+    now_ts = time.time()
+    cooldown_until = st.session_state.get("cooldown_until", 0)
+    remaining = max(0, int(cooldown_until - now_ts))
 
-        stock_total = stock_p.copy()  # solo stock_snapshot
+    # HENRY: placeholder para mostrar un contador en vivo
+    cooldown_placeholder = st.empty()
 
-    # filtrar por SKU
-    if modo == "Por SKU" and sku_q:
-        f = str(sku_q).strip().lower()
-        ventas      = ventas[ventas["sku"].str.lower() == f]
-        stock_p     = stock_p[stock_p["sku"].str.lower() == f]
-        stock_t     = stock_t[stock_t["sku"].str.lower() == f]
-        stock_total = stock_total[stock_total["sku"].str.lower() == f]
-        config      = config[config["sku"].str.lower() == f]
-        inbound     = inbound[inbound["sku"].str.lower() == f]
-
-    inbound_core = prepare_inbound_for_core(inbound)
-
-    # panel resumen
-    sku_mostrar = sku_q.upper() if sku_q else "(varios)"
-    stock_env   = float(stock_total["stock"].sum()) if not stock_total.empty else 0
-    inbound_env = int(inbound_core["qty"].sum()) if not inbound_core.empty else 0
-
-    colm1, colm2, colm3, colm4 = st.columns(4)
-    colm1.metric("SKU", sku_mostrar)
-    colm2.metric("Stock enviado al core", stock_env)
-    colm3.metric("Inbound detectado", inbound_env)
-    placeholder_propuesta = colm4.empty()
-
-    # secciones técnicas
-    with st.expander("Estado de los Servicios 📄", expanded=False):
-        st.write(f"Ventas: {'✅ OK' if not ventas_raw.empty else '⚠️ Vacío'}")
-        st.write(f"Stock (stock_snapshot): {'✅ OK' if not stock_raw.empty else '⚠️ Vacío'}")
-        st.write(f"Stock transición (solo informativo): {'✅ OK' if not stock_tr_raw.empty else '⚠️ Vacío'}")
-        st.write(f"Inbound: {'✅ OK' if not inbound_raw.empty else '⚠️ Vacío'}")
-
-    if mostrar_stocks:
-        with st.expander("Stocks leídos", expanded=False):
-            st.subheader("Stock (stock_snapshot)")
-            st.dataframe(stock_p, use_container_width=True, hide_index=True)
-            st.subheader("Stock transición (informativo, NO se usa en el cálculo)")
-            st.dataframe(stock_t, use_container_width=True, hide_index=True)
-            st.subheader("Stock TOTAL enviado al core")
-            st.dataframe(stock_total, use_container_width=True, hide_index=True)
-
-    if mostrar_inbound:
-        with st.expander("Inbound (crudo de Sheets) / agrupado", expanded=False):
-            st.subheader("Inbound (crudo de Sheets)")
-            st.dataframe(inbound, use_container_width=True)
-            st.subheader("Inbound agrupado que se envía al core")
-            st.dataframe(inbound_core, use_container_width=True)
-
-    if mostrar_debug:
-        with st.expander("DEBUG de Config", expanded=False):
-            st.code(list(config.columns), language="python")
-            st.dataframe(config.head(), use_container_width=True)
-
-    # si no hay ventas
-    if ventas.empty:
-        st.warning("No hay ventas para los filtros dados.")
-    else:
-        with st.spinner("Calculando pronóstico…"):
-            freq_code = "M" if freq.startswith("Mensual") else "W"
-            det, res, prop = forecast_all(
-                ventas=ventas,
-                stock=stock_total,
-                config=config,
-                inbound=inbound_core,
-                freq=freq_code,
-                horizon_override=horizon,
+    if remaining > 0:
+        # Contador regresivo en vivo (máx 90s según los COOLDOWN_* que definimos)
+        for sec in range(remaining, 0, -1):
+            cooldown_placeholder.warning(
+                "Se están actualizando datos desde KAME/Make. "
+                f"Espera aproximadamente {sec} segundos antes de ejecutar la predicción."
             )
-
-        st.success("Listo ✅")
-
-        # al terminar una corrida correcta, limpiamos el cooldown y el batch
+            time.sleep(1)
+        # Al terminar el contador limpiamos estado y mensaje
+        cooldown_placeholder.empty()
         st.session_state["cooldown_until"] = 0
-        st.session_state["batch_scenarios_disparados"] = False
+        remaining = 0
 
-        if not prop.empty:
-            total_prop = int(prop["qty_sugerida"].sum())
-            placeholder_propuesta.metric("Propuesta sugerida", total_prop)
+    # Si ya no hay espera pendiente, el botón queda habilitado
+    if remaining > 0:
+        main_label = f"Ejecutar predicción (espera {remaining}s)"
+        main_disabled = True
+    else:
+        main_label = "Ejecutar predicción"
+        main_disabled = False
+
+    if st.button(main_label, type="primary", use_container_width=True, disabled=main_disabled):
+        # HENRY: modo "disparar S1/S2/S3 antes de predecir"
+        if disparar and not st.session_state.get("batch_scenarios_disparados", False):
+            st.info("Disparando S1 (ventas), S2 (stock total) y S3 (inbound) desde la app…")
+
+            s1 = trigger_make(MAKE_WEBHOOK_S1_URL, {"reason": "ui_run", "tenant_id": TENANT_ID})
+            s2 = trigger_make(
+                MAKE_WEBHOOK_S2_URL,
+                {"reason": "ui_run", "tenant_id": TENANT_ID, "use_stock_total": True},
+            )
+            s3 = trigger_make(MAKE_WEBHOOK_S3_URL, {"reason": "ui_run", "tenant_id": TENANT_ID})
+
+            if s1.get("ok") and s2.get("ok") and s3.get("ok"):
+                # un solo cooldown largo para los tres (usa los mismos tiempos definidos arriba)
+                start_cooldown(max(COOLDOWN_S1, COOLDOWN_S2, COOLDOWN_S3))
+                st.session_state["batch_scenarios_disparados"] = True
+            else:
+                st.error(
+                    "Alguno de los escenarios S1/S2/S3 devolvió error. "
+                    "Revisa el escenario en Make antes de ejecutar la predicción."
+                )
+            st.rerun()  # volvemos a correr el script para que aparezca el contador
+
+        # Si llegamos aquí:
+        # - disparar == False  → predicción normal
+        # - disparar == True y batch_scenarios_disparados == True → ya esperamos el cooldown, ahora sí predecimos
+
+        # leer datos
+        with st.spinner("Leyendo datos de Sheets…"):
+            ventas_raw   = read_gsheets(CURRENT_SHEET_ID, TAB_VENTAS)
+            stock_raw    = read_gsheets(CURRENT_SHEET_ID, TAB_STOCK)
+            stock_tr_raw = read_gsheets(CURRENT_SHEET_ID, TAB_STOCK_TRANS)
+            config_raw   = read_gsheets(CURRENT_SHEET_ID, TAB_CONFIG)
+            inbound_raw  = read_gsheets(CURRENT_SHEET_ID, TAB_INBOUND)
+
+            ventas  = normalize_ventas_sheet(ventas_raw)
+            stock_p = normalize_stock_sheet(stock_raw)
+            stock_t = normalize_stock_sheet(stock_tr_raw)
+            config  = normalize_config_sheet(config_raw, ventas, stock_p)
+            inbound = normalize_inbound_sheet(inbound_raw)
+
+            stock_total = stock_p.copy()  # solo stock_snapshot
+
+        # filtrar por SKU
+        if modo == "Por SKU" and sku_q:
+            f = str(sku_q).strip().lower()
+            ventas      = ventas[ventas["sku"].str.lower() == f]
+            stock_p     = stock_p[stock_p["sku"].str.lower() == f]
+            stock_t     = stock_t[stock_t["sku"].str.lower() == f]
+            stock_total = stock_total[stock_total["sku"].str.lower() == f]
+            config      = config[config["sku"].str.lower() == f]
+            inbound     = inbound[inbound["sku"].str.lower() == f]
+
+        inbound_core = prepare_inbound_for_core(inbound)
+
+        # panel resumen
+        sku_mostrar = sku_q.upper() if sku_q else "(varios)"
+        stock_env   = float(stock_total["stock"].sum()) if not stock_total.empty else 0
+        inbound_env = int(inbound_core["qty"].sum()) if not inbound_core.empty else 0
+
+        colm1, colm2, colm3, colm4 = st.columns(4)
+        colm1.metric("SKU", sku_mostrar)
+        colm2.metric("Stock enviado al core", stock_env)
+        colm3.metric("Inbound detectado", inbound_env)
+        placeholder_propuesta = colm4.empty()
+
+        # secciones técnicas
+        with st.expander("Estado de los Servicios 📄", expanded=False):
+            st.write(f"Ventas: {'✅ OK' if not ventas_raw.empty else '⚠️ Vacío'}")
+            st.write(f"Stock (stock_snapshot): {'✅ OK' if not stock_raw.empty else '⚠️ Vacío'}")
+            st.write(f"Stock transición (solo informativo): {'✅ OK' if not stock_tr_raw.empty else '⚠️ Vacío'}")
+            st.write(f"Inbound: {'✅ OK' if not inbound_raw.empty else '⚠️ Vacío'}")
+
+        if mostrar_stocks:
+            with st.expander("Stocks leídos", expanded=False):
+                st.subheader("Stock (stock_snapshot)")
+                st.dataframe(stock_p, use_container_width=True, hide_index=True)
+                st.subheader("Stock transición (informativo, NO se usa en el cálculo)")
+                st.dataframe(stock_t, use_container_width=True, hide_index=True)
+                st.subheader("Stock TOTAL enviado al core")
+                st.dataframe(stock_total, use_container_width=True, hide_index=True)
+
+        if mostrar_inbound:
+            with st.expander("Inbound (crudo de Sheets) / agrupado", expanded=False):
+                st.subheader("Inbound (crudo de Sheets)")
+                st.dataframe(inbound, use_container_width=True)
+                st.subheader("Inbound agrupado que se envía al core")
+                st.dataframe(inbound_core, use_container_width=True)
+
+        if mostrar_debug:
+            with st.expander("DEBUG de Config", expanded=False):
+                st.code(list(config.columns), language="python")
+                st.dataframe(config.head(), use_container_width=True)
+
+        # si no hay ventas
+        if ventas.empty:
+            st.warning("No hay ventas para los filtros dados.")
         else:
-            placeholder_propuesta.metric("Propuesta sugerida", 0)
+            with st.spinner("Calculando pronóstico…"):
+                freq_code = "M" if freq.startswith("Mensual") else "W"
+                det, res, prop = forecast_all(
+                    ventas=ventas,
+                    stock=stock_total,
+                    config=config,
+                    inbound=inbound_core,
+                    freq=freq_code,
+                    horizon_override=horizon,
+                )
 
-        st.subheader("Propuesta de compra ↪")
-        st.dataframe(prop, use_container_width=True)
-        st.download_button(
-            "Descargar propuesta (CSV)",
-            prop.to_csv(index=False).encode("utf-8"),
-            "propuesta.csv",
-            "text/csv",
+            st.success("Listo ✅")
+
+            # al terminar una corrida correcta, limpiamos el cooldown y el batch
+            st.session_state["cooldown_until"] = 0
+            st.session_state["batch_scenarios_disparados"] = False
+
+            if not prop.empty:
+                total_prop = int(prop["qty_sugerida"].sum())
+                placeholder_propuesta.metric("Propuesta sugerida", total_prop)
+            else:
+                placeholder_propuesta.metric("Propuesta sugerida", 0)
+
+            st.subheader("Propuesta de compra ↪")
+            st.dataframe(prop, use_container_width=True)
+            st.download_button(
+                "Descargar propuesta (CSV)",
+                prop.to_csv(index=False).encode("utf-8"),
+                "propuesta.csv",
+                "text/csv",
+            )
+
+            st.subheader("Resumen por SKU ↪")
+            st.dataframe(res, use_container_width=True)
+            st.download_button(
+                "Descargar resumen (CSV)",
+                res.to_csv(index=False).encode("utf-8"),
+                "pred_resumen.csv",
+                "text/csv",
+            )
+
+            st.subheader("Detalle por período")
+            st.dataframe(det, use_container_width=True)
+            st.download_button(
+                "Descargar detalle (CSV)",
+                det.to_csv(index=False).encode("utf-8"),
+                "pred_detalle.csv",
+                "text/csv",
+            )
+
+# ======================================
+# ======================================
+# MÓDULO VENTAS (FUNCIONAL, CON ESTACIONALIDAD MANUAL)
+# ======================================
+elif modulo_activo == "Ventas":
+    st.title("📈 Predictor de Ventas (beta)")
+    st.caption(f"Fuente de datos: **{modo_datos}** — Tenant: **{TENANT_NAME}**")
+
+    if forecast_sales is None:
+        st.error(
+            "No se encontró `predictor_sales_core.forecast_sales`. "
+            "Verifica que el archivo `predictor_sales_core.py` exista en la misma carpeta."
+        )
+        st.stop()
+
+    col1, col2, col3 = st.columns(3)
+    freq_label = col1.selectbox("Frecuencia", ["Mensual (M)", "Semanal (W)"], index=0)
+    horizon    = col2.slider("Horizonte (períodos)", 2, 24, 6, 1)
+    modo       = col3.selectbox("Modo", ["Global", "Por SKU"], index=0)
+    sku_q      = st.text_input("SKU (opcional)") if modo == "Por SKU" else None
+
+    # === NUEVO: configuración de estacionalidad manual por mes ===
+    # Persistencia en session_state (Mejora #6)
+    if "seasonal_weights" not in st.session_state:
+        st.session_state["seasonal_weights"] = None
+    if "usar_estacionalidad" not in st.session_state:
+        st.session_state["usar_estacionalidad"] = False
+    
+    seasonal_weights = st.session_state.get("seasonal_weights")
+    usar_estacionalidad = st.session_state.get("usar_estacionalidad", False)
+
+    with st.expander("Estacionalidad manual por mes (opcional)", expanded=False):
+        usar_estacionalidad = st.checkbox(
+            "Activar ajuste manual de meses altos / bajos",
+            value=usar_estacionalidad,
+            help="Si lo desmarcas, el modelo usa solo la serie histórica sin ajustes manuales."
+        )
+        st.session_state["usar_estacionalidad"] = usar_estacionalidad
+
+        # Meses en texto para que sea más cómodo
+        meses_labels = {
+            1: "1 - Enero",
+            2: "2 - Febrero",
+            3: "3 - Marzo",
+            4: "4 - Abril",
+            5: "5 - Mayo",
+            6: "6 - Junio",
+            7: "7 - Julio",
+            8: "8 - Agosto",
+            9: "9 - Septiembre",
+            10: "10 - Octubre",
+            11: "11 - Noviembre",
+            12: "12 - Diciembre",
+        }
+
+        # Defaults pensados para Recotoner (bajos: dic-ene-feb, alto: marzo)
+        # Cargar desde session_state si existe
+        saved_low = st.session_state.get("low_default_labels", ["12 - Diciembre", "1 - Enero", "2 - Febrero"])
+        saved_high = st.session_state.get("high_default_labels", ["3 - Marzo"])
+        saved_low_factor = st.session_state.get("low_factor", 0.7)
+        saved_high_factor = st.session_state.get("high_factor", 1.1)
+        
+        low_default_labels  = saved_low
+        high_default_labels = saved_high
+
+        low_sel = st.multiselect(
+            "Meses con baja estacionalidad (ventas más bajas que el promedio)",
+            options=list(meses_labels.values()),
+            default=low_default_labels,
+        )
+        high_sel = st.multiselect(
+            "Meses con alta estacionalidad (ventas más altas que el promedio)",
+            options=list(meses_labels.values()),
+            default=high_default_labels,
         )
 
-        st.subheader("Resumen por SKU ↪")
-        st.dataframe(res, use_container_width=True)
-        st.download_button(
-            "Descargar resumen (CSV)",
-            res.to_csv(index=False).encode("utf-8"),
-            "pred_resumen.csv",
-            "text/csv",
-        )
+        # Mejora #2: Validación de conflictos en meses
+        label_to_month = {v: k for k, v in meses_labels.items()}
+        low_months = {label_to_month[x] for x in low_sel if x in label_to_month}
+        high_months = {label_to_month[x] for x in high_sel if x in label_to_month}
+        conflict_months = low_months.intersection(high_months)
+        
+        if conflict_months and usar_estacionalidad:
+            conflict_names = [meses_labels[m] for m in conflict_months]
+            st.warning(
+                f"⚠️ **Atención**: Los siguientes meses están en ambas categorías (bajos y altos): "
+                f"{', '.join(conflict_names)}. "
+                f"Se aplicará el factor de meses altos (tiene prioridad)."
+            )
 
-        st.subheader("Detalle por período")
-        st.dataframe(det, use_container_width=True)
-        st.download_button(
-            "Descargar detalle (CSV)",
-            det.to_csv(index=False).encode("utf-8"),
-            "pred_detalle.csv",
-            "text/csv",
+        c_low, c_high = st.columns(2)
+        low_factor = c_low.slider(
+            "Factor para meses bajos",
+            min_value=0.3,
+            max_value=1.0,
+            value=saved_low_factor,
+            step=0.05,
+            help="Ej: 0.7 significa que esos meses se proyectan al 70% del nivel base.",
         )
+        high_factor = c_high.slider(
+            "Factor para meses altos",
+            min_value=1.0,
+            max_value=1.7,
+            value=saved_high_factor,
+            step=0.05,
+            help="Ej: 1.1 significa que esos meses se proyectan al 110% del nivel base.",
+        )
+        
+        # Guardar en session_state
+        st.session_state["low_default_labels"] = low_sel
+        st.session_state["high_default_labels"] = high_sel
+        st.session_state["low_factor"] = low_factor
+        st.session_state["high_factor"] = high_factor
+
+        if usar_estacionalidad:
+            # Convertimos textos seleccionados a números de mes
+            seasonal_weights = {}
+            for m in range(1, 13):
+                w = 1.0
+                if m in low_months:
+                    w = low_factor
+                if m in high_months:
+                    # Mejora #2: Si hay conflicto, prioridad a meses altos
+                    w = high_factor
+                seasonal_weights[m] = float(w)
+            
+            # Guardar en session_state
+            st.session_state["seasonal_weights"] = seasonal_weights
+            
+            # Mejora #3: Feedback visual de factores aplicados
+            st.markdown("---")
+            st.markdown("**📊 Factores de estacionalidad configurados:**")
+            factors_df = pd.DataFrame([
+                {"Mes": meses_labels[m], "Factor": f"{w:.2f}x", 
+                 "Tipo": "Bajo" if w < 1.0 else "Alto" if w > 1.0 else "Normal"}
+                for m, w in sorted(seasonal_weights.items())
+            ])
+            st.dataframe(factors_df, use_container_width=True, hide_index=True)
+        else:
+            st.session_state["seasonal_weights"] = None
+    
+    # Actualizar variable local desde session_state después del expander
+    seasonal_weights = st.session_state.get("seasonal_weights")
+    usar_estacionalidad = st.session_state.get("usar_estacionalidad", False)
+    # === FIN estacionalidad manual ===
+
+    if st.button("Calcular proyección de ventas", type="primary", use_container_width=True):
+        # Definir variables al inicio del bloque del botón
+        freq_code = "M" if freq_label.startswith("Mensual") else "W"
+        estacionalidad_aplicada = False
+        
+        with st.spinner("Leyendo ventas_raw y calculando proyección…"):
+            ventas_raw = read_gsheets(CURRENT_SHEET_ID, TAB_VENTAS)
+            ventas_ext = normalize_ventas_for_sales(ventas_raw)
+
+            # Filtro por SKU (opcional)
+            if modo == "Por SKU" and sku_q:
+                f = str(sku_q).strip().upper()
+                ventas_ext = ventas_ext[ventas_ext["sku"] == f]
+
+            if ventas_ext is None or ventas_ext.empty:
+                st.warning("No hay ventas para los filtros dados.")
+                st.stop()
+
+            # Mejora #1: Advertencia cuando se selecciona frecuencia semanal
+            if usar_estacionalidad and seasonal_weights is not None:
+                if freq_code == "W":
+                    st.warning(
+                        "⚠️ **Nota**: Los factores de estacionalidad solo se aplican para frecuencia **Mensual (M)**. "
+                        "Con frecuencia Semanal (W), los factores no se aplicarán."
+                    )
+                else:
+                    estacionalidad_aplicada = True
+
+            # Core de ventas, con soporte para seasonality_factors si la firma lo acepta
+            extra_kwargs = {}
+            if usar_estacionalidad and seasonal_weights is not None and freq_code == "M":
+                extra_kwargs["seasonality_factors"] = seasonal_weights
+
+            # Mejora #4: Mejor manejo de errores
+            det_v = None
+            res_v = None
+            error_ocurrido = None
+            
+            try:
+                det_v, res_v = forecast_sales(
+                    ventas_ext,
+                    freq=freq_code,
+                    horizon=horizon,
+                    **extra_kwargs,
+                )
+            except TypeError as e:
+                # fallback por si la versión del core no acepta seasonality_factors
+                try:
+                    det_v, res_v = forecast_sales(
+                        ventas_ext,
+                        freq=freq_code,
+                        horizon=horizon,
+                    )
+                    if usar_estacionalidad and seasonal_weights is not None:
+                        st.info("ℹ️ La versión del core no soporta factores de estacionalidad. Se ejecutó sin ajustes estacionales.")
+                except Exception as e2:
+                    error_ocurrido = f"Error al ejecutar forecast sin estacionalidad: {str(e2)}"
+            except ValueError as e:
+                error_ocurrido = f"Error de validación: {str(e)}"
+            except Exception as e:
+                error_ocurrido = f"Error inesperado al calcular proyección: {str(e)}"
+            
+            if error_ocurrido:
+                st.error(f"❌ {error_ocurrido}")
+                st.stop()
+
+        # Métricas rápidas
+        total_hist = float(ventas_ext["venta_neta"].sum())
+        sku_count  = int(ventas_ext["sku"].nunique())
+
+        # Mejora #5: Indicador de estacionalidad aplicada
+        if estacionalidad_aplicada:
+            st.success("✅ **Estacionalidad aplicada**: Los factores de estacionalidad se han aplicado correctamente a las predicciones.")
+        elif usar_estacionalidad and seasonal_weights is not None and freq_code == "W":
+            st.info("ℹ️ **Estacionalidad no aplicada**: Los factores solo funcionan con frecuencia Mensual (M).")
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("SKUs considerados", sku_count)
+        m2.metric("Venta histórica total", f"${total_hist:,.0f}")
+        if res_v is not None and not res_v.empty and "venta_forecast_total" in res_v.columns:
+            total_forecast = float(res_v["venta_forecast_total"].sum())
+            m3.metric("Venta proyectada (horizonte)", f"${total_forecast:,.0f}")
+        else:
+            m3.metric("Venta proyectada (horizonte)", "$0")
+
+        # Tablas
+        if res_v is not None and not res_v.empty:
+            st.subheader("Resumen de ventas proyectadas por SKU")
+            st.dataframe(res_v, use_container_width=True)
+            st.download_button(
+                "Descargar resumen de ventas (CSV)",
+                res_v.to_csv(index=False).encode("utf-8"),
+                "ventas_resumen.csv",
+                "text/csv",
+            )
+            
+            # Sección de métricas de calidad del forecast
+            # Verificar si existen columnas de métricas
+            has_metrics = any(col in res_v.columns for col in ["mape", "rmse", "mae", "demand_class", "adi", "cv2"])
+            
+            if has_metrics:
+                st.markdown("---")
+                st.subheader("📊 Métricas de calidad del forecast")
+                
+                # Debug: mostrar qué columnas están disponibles
+                if st.checkbox("🔍 Mostrar información de debug", value=False):
+                    st.write("**Columnas disponibles en res_v:**")
+                    st.write(list(res_v.columns))
+                    st.write("**Primera fila de datos:**")
+                    st.write(res_v.iloc[0].to_dict() if len(res_v) > 0 else "No hay datos")
+                
+                # Filtrar SKUs con métricas disponibles
+                metrics_cols = ["sku", "modelo", "demand_class", "mape", "rmse", "mae", "adi", "cv2"]
+                available_metrics = [col for col in metrics_cols if col in res_v.columns]
+                
+                if available_metrics:
+                    # Asegurarse de que al menos tenemos SKU y modelo
+                    if "sku" not in available_metrics:
+                        available_metrics.insert(0, "sku")
+                    if "modelo" in res_v.columns and "modelo" not in available_metrics:
+                        available_metrics.insert(1, "modelo")
+                    
+                    metrics_df = res_v[available_metrics].copy()
+                    
+                    # Mostrar cuántos SKUs tienen métricas calculadas
+                    if "mape" in metrics_df.columns:
+                        n_with_mape = metrics_df["mape"].notna().sum()
+                        if n_with_mape < len(metrics_df):
+                            st.info(
+                                f"ℹ️ {n_with_mape} de {len(metrics_df)} SKUs tienen métricas calculadas. "
+                                f"Los demás pueden tener datos históricos insuficientes (< 8 períodos) para validación."
+                            )
+                    
+                    # Formatear métricas para mejor visualización
+                    if "mape" in metrics_df.columns:
+                        metrics_df["mape"] = metrics_df["mape"].apply(
+                            lambda x: f"{x:.2f}%" if pd.notna(x) and x is not None else "N/A"
+                        )
+                    if "rmse" in metrics_df.columns:
+                        metrics_df["rmse"] = metrics_df["rmse"].apply(
+                            lambda x: f"${x:,.0f}" if pd.notna(x) and x is not None else "N/A"
+                        )
+                    if "mae" in metrics_df.columns:
+                        metrics_df["mae"] = metrics_df["mae"].apply(
+                            lambda x: f"${x:,.0f}" if pd.notna(x) and x is not None else "N/A"
+                        )
+                    if "adi" in metrics_df.columns:
+                        metrics_df["adi"] = metrics_df["adi"].apply(
+                            lambda x: f"{x:.2f}" if pd.notna(x) and x is not None else "N/A"
+                        )
+                    if "cv2" in metrics_df.columns:
+                        metrics_df["cv2"] = metrics_df["cv2"].apply(
+                            lambda x: f"{x:.3f}" if pd.notna(x) and x is not None else "N/A"
+                        )
+                    
+                    st.dataframe(metrics_df, use_container_width=True, hide_index=True)
+                else:
+                    st.info("ℹ️ Las métricas no están disponibles. Verifica que el core esté calculando las métricas correctamente.")
+                
+                # Resumen agregado de métricas (solo si hay métricas disponibles)
+                if available_metrics and any(col in res_v.columns for col in ["mape", "rmse", "mae"]):
+                    with st.expander("📈 Resumen agregado de métricas", expanded=False):
+                        col1, col2, col3 = st.columns(3)
+                        
+                        # MAPE promedio (solo de los que tienen valor)
+                        if "mape" in res_v.columns:
+                            mape_values = res_v["mape"].dropna()
+                            if len(mape_values) > 0:
+                                mape_avg = float(mape_values.mean())
+                                col1.metric("MAPE promedio", f"{mape_avg:.2f}%", 
+                                          help="Mean Absolute Percentage Error - menor es mejor")
+                        
+                        # RMSE promedio
+                        if "rmse" in res_v.columns:
+                            rmse_values = res_v["rmse"].dropna()
+                            if len(rmse_values) > 0:
+                                rmse_avg = float(rmse_values.mean())
+                                col2.metric("RMSE promedio", f"${rmse_avg:,.0f}",
+                                          help="Root Mean Squared Error - menor es mejor")
+                        
+                        # MAE promedio
+                        if "mae" in res_v.columns:
+                            mae_values = res_v["mae"].dropna()
+                            if len(mae_values) > 0:
+                                mae_avg = float(mae_values.mean())
+                                col3.metric("MAE promedio", f"${mae_avg:,.0f}",
+                                          help="Mean Absolute Error - menor es mejor")
+                        
+                        # Distribución de clasificación de demanda
+                        if "demand_class" in res_v.columns:
+                            st.markdown("**Distribución de clasificación de demanda:**")
+                            demand_dist = res_v["demand_class"].value_counts()
+                            st.write(demand_dist.to_dict())
+                        
+                        # Distribución de modelos
+                        if "modelo" in res_v.columns:
+                            st.markdown("**Distribución de modelos utilizados:**")
+                            model_dist = res_v["modelo"].value_counts()
+                            st.write(model_dist.to_dict())
+
+        if det_v is not None and not det_v.empty:
+            st.subheader("Detalle histórico + forecast")
+            st.dataframe(det_v, use_container_width=True)
+            st.download_button(
+                "Descargar detalle (CSV)",
+                det_v.to_csv(index=False).encode("utf-8"),
+                "ventas_detalle.csv",
+                "text/csv",
+            )
+
+
+
+
 
 
 
