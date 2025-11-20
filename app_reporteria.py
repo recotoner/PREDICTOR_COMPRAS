@@ -19,7 +19,7 @@ TAB_CLIENTES_CONF  = "clientes_config"
 # URL de la otra app (predictor) para navegar
 PREDICTOR_APP_URL = "https://predictor-compras.onrender.com/"
 
-st.set_page_config(page_title="Reportería de Ventas", layout="wide")
+st.set_page_config(page_title="REPORTES", layout="wide")
 
 # ============================
 # COSMÉTICA (igual que predictor)
@@ -67,6 +67,29 @@ st.markdown(
     /* títulos más juntitos al estilo predictor */
     h1, h2, h3 {
         letter-spacing: -0.02rem;
+    }
+    
+    /* Estilo mejorado para el link de navegación */
+    [data-testid="stSidebar"] a {
+        display: inline-block !important;
+        padding: 12px 16px !important;
+        background: linear-gradient(135deg, rgba(15, 118, 110, 0.1) 0%, rgba(20, 184, 166, 0.1) 100%) !important;
+        border: 1.5px solid rgba(15, 118, 110, 0.3) !important;
+        border-radius: 10px !important;
+        color: #14b8a6 !important;
+        text-decoration: none !important;
+        font-weight: 500 !important;
+        transition: all 0.3s ease !important;
+        margin: 4px 0 !important;
+        width: 100% !important;
+        box-sizing: border-box !important;
+    }
+    [data-testid="stSidebar"] a:hover {
+        background: linear-gradient(135deg, rgba(15, 118, 110, 0.2) 0%, rgba(20, 184, 166, 0.2) 100%) !important;
+        border-color: rgba(15, 118, 110, 0.5) !important;
+        color: #0d9488 !important;
+        transform: translateX(4px) !important;
+        box-shadow: 0 2px 8px rgba(15, 118, 110, 0.2) !important;
     }
     </style>
     """,
@@ -148,7 +171,8 @@ if clientes_df is not None and len(clientes_df):
 # --- navegación lateral ---
 st.sidebar.markdown("### Navegación")
 st.sidebar.markdown(
-    f"[🧠 Predictor de compras]({PREDICTOR_APP_URL}?tenant={CURRENT_TENANT_ID})"
+    f"""<div style="margin-top: 8px;"><a href="{PREDICTOR_APP_URL}?tenant={CURRENT_TENANT_ID}" style="display: inline-block; padding: 12px 16px; background: linear-gradient(135deg, rgba(15, 118, 110, 0.1) 0%, rgba(20, 184, 166, 0.1) 100%); border: 1.5px solid rgba(15, 118, 110, 0.3); border-radius: 10px; color: #14b8a6; text-decoration: none; font-weight: 500; transition: all 0.3s ease; width: 100%; box-sizing: border-box;">🧠 Predictor de compras</a></div>""",
+    unsafe_allow_html=True,
 )
 st.sidebar.markdown("---")
 
@@ -376,7 +400,6 @@ else:
             use_container_width=True,
             hide_index=True,
         )
-
 
 
 

@@ -60,20 +60,100 @@ st.markdown(
     }
     [data-testid="stSidebar"] .stSelectbox label { color: #ffffff !important; }
     [data-testid="stSidebar"] .stSelectbox svg { color: #ffffff !important; }
+    [data-testid="stSidebar"] .stButton > button {
+        background: linear-gradient(135deg, #475569 0%, #64748b 100%) !important;
+        color: #ffffff !important;
+        border: none !important;
+        border-radius: 10px !important;
+        height: 42px;
+        font-weight: 500;
+        box-shadow: 0 2px 8px rgba(71, 85, 105, 0.2) !important;
+        transition: all 0.3s ease !important;
+    }
+    [data-testid="stSidebar"] .stButton > button:hover {
+        background: linear-gradient(135deg, #64748b 0%, #475569 100%) !important;
+        box-shadow: 0 4px 12px rgba(71, 85, 105, 0.3) !important;
+        transform: translateY(-1px) !important;
+    }
+    /* Estilo mejorado para el link de navegación */
+    [data-testid="stSidebar"] a {
+        display: inline-block !important;
+        padding: 12px 16px !important;
+        background: linear-gradient(135deg, rgba(15, 118, 110, 0.1) 0%, rgba(20, 184, 166, 0.1) 100%) !important;
+        border: 1.5px solid rgba(15, 118, 110, 0.3) !important;
+        border-radius: 10px !important;
+        color: #14b8a6 !important;
+        text-decoration: none !important;
+        font-weight: 500 !important;
+        transition: all 0.3s ease !important;
+        margin: 4px 0 !important;
+        width: 100% !important;
+        box-sizing: border-box !important;
+    }
+    [data-testid="stSidebar"] a:hover {
+        background: linear-gradient(135deg, rgba(15, 118, 110, 0.2) 0%, rgba(20, 184, 166, 0.2) 100%) !important;
+        border-color: rgba(15, 118, 110, 0.5) !important;
+        color: #0d9488 !important;
+        transform: translateX(4px) !important;
+        box-shadow: 0 2px 8px rgba(15, 118, 110, 0.2) !important;
+    }
+    /* Estilo mejorado para radio buttons del sidebar */
+    [data-testid="stSidebar"] .stRadio > div {
+        background: rgba(15, 23, 42, 0.3) !important;
+        border-radius: 12px !important;
+        padding: 8px !important;
+        border: 1px solid rgba(255, 255, 255, 0.1) !important;
+    }
+    [data-testid="stSidebar"] .stRadio label {
+        color: #e2e8f0 !important;
+        font-weight: 500 !important;
+        padding: 8px 12px !important;
+        border-radius: 8px !important;
+        transition: all 0.2s ease !important;
+        cursor: pointer !important;
+        display: inline-block !important;
+        margin: 2px 0 !important;
+    }
+    [data-testid="stSidebar"] .stRadio label:hover {
+        background: rgba(15, 118, 110, 0.15) !important;
+        color: #14b8a6 !important;
+    }
+    [data-testid="stSidebar"] .stRadio input[type="radio"]:checked + label,
+    [data-testid="stSidebar"] .stRadio [data-baseweb="radio"] [aria-checked="true"] ~ label {
+        background: linear-gradient(135deg, #0f766e 0%, #14b8a6 100%) !important;
+        color: #ffffff !important;
+        font-weight: 600 !important;
+        box-shadow: 0 2px 8px rgba(15, 118, 110, 0.3) !important;
+    }
+    [data-testid="stSidebar"] .stRadio [data-baseweb="radio"] {
+        background: transparent !important;
+    }
     .stTextInput > div > div,
     .stSelectbox:not([data-testid="stSidebar"] .stSelectbox) > div > div {
         border: 1px solid rgba(15, 23, 42, 0.15) !important;
         border-radius: 10px !important;
     }
     .stButton > button {
-        background-color: #0f766e !important;
+        background: linear-gradient(135deg, #0f766e 0%, #14b8a6 100%) !important;
         color: #ffffff !important;
         border: none !important;
-        border-radius: 10px !important;
-        height: 46px;
+        border-radius: 12px !important;
+        height: 48px;
         font-weight: 600;
+        font-size: 15px;
+        box-shadow: 0 4px 12px rgba(15, 118, 110, 0.3) !important;
+        transition: all 0.3s ease !important;
+        padding: 0 24px !important;
     }
-    .stButton > button:hover { background-color: #115e57 !important; }
+    .stButton > button:hover { 
+        background: linear-gradient(135deg, #115e57 0%, #0f766e 100%) !important;
+        box-shadow: 0 6px 16px rgba(15, 118, 110, 0.4) !important;
+        transform: translateY(-1px) !important;
+    }
+    .stButton > button:active {
+        transform: translateY(0px) !important;
+        box-shadow: 0 2px 8px rgba(15, 118, 110, 0.3) !important;
+    }
     .hero-card{
         max-width: 760px; margin: 32px auto; padding: 28px 32px;
         background:#fff; border-radius:18px; box-shadow:0 10px 30px rgba(2,6,23,.08);
@@ -83,6 +163,25 @@ st.markdown(
     .hero-title{font-size:36px; font-weight:800; margin:6px 0 10px 0;}
     .hero-sub{color:#334155; margin-bottom:24px;}
     .hero-chart{width:100%; height:140px;}
+    h1 { 
+        font-weight: 700 !important;
+        color: #0f172a !important;
+        margin-bottom: 0.5rem !important;
+    }
+    h2 { 
+        font-weight: 600 !important;
+        color: #1e293b !important;
+    }
+    .stSelectbox > div > div {
+        border-radius: 10px !important;
+        transition: all 0.2s ease !important;
+    }
+    .stSelectbox > div > div:hover {
+        border-color: #0f766e !important;
+    }
+    .stSlider > div > div {
+        border-radius: 10px !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -576,7 +675,7 @@ if "MODULO_ACTIVO" not in st.session_state or st.session_state["MODULO_ACTIVO"] 
 # --- navegación lateral ---
 st.sidebar.markdown("### Navegación")
 st.sidebar.markdown(
-    f"""<a href="{target_report_url}" target="_blank">📊 Reportería de ventas</a>""",
+    f"""<div style="margin-top: 8px;"><a href="{target_report_url}" target="_blank" style="display: inline-block; padding: 12px 16px; background: linear-gradient(135deg, rgba(15, 118, 110, 0.1) 0%, rgba(20, 184, 166, 0.1) 100%); border: 1.5px solid rgba(15, 118, 110, 0.3); border-radius: 10px; color: #14b8a6; text-decoration: none; font-weight: 500; transition: all 0.3s ease; width: 100%; box-sizing: border-box;">📊 Reportería de ventas</a></div>""",
     unsafe_allow_html=True,
 )
 st.sidebar.markdown("---")
@@ -839,7 +938,7 @@ if modulo_activo == "Compras":
 # MÓDULO VENTAS (FUNCIONAL, CON ESTACIONALIDAD MANUAL)
 # ======================================
 elif modulo_activo == "Ventas":
-    st.title("📈 Predictor de Ventas (beta)")
+    st.title("📈 Predictor de Ventas")
     st.caption(f"Fuente de datos: **{modo_datos}** — Tenant: **{TENANT_NAME}**")
 
     if forecast_sales is None:
