@@ -948,6 +948,45 @@ elif modulo_activo == "Ventas":
         )
         st.stop()
 
+    # --------------------------------------
+    # BOTÓN ACTUALIZAR VENTAS (S1)
+    # --------------------------------------
+    if st.button("📘 Actualizar ventas (S1)", use_container_width=True):
+        resp = trigger_make(MAKE_WEBHOOK_S1_URL, {"reason": "ui_run", "tenant_id": TENANT_ID})
+        if resp.get("ok"):
+            st.success("Actualización de ventas enviada a Make. Espera ~60 segundos antes de ejecutar la predicción.")
+            start_cooldown(COOLDOWN_S1)
+            st.rerun()  # Recargar para mostrar el contador regresivo
+        else:
+            st.error(
+                f"No se pudo actualizar ventas (S1). "
+                f"Código: {resp.get('status')}, detalle: {resp.get('error') or resp.get('text')}"
+            )
+
+    # Contador regresivo (igual que en Compras)
+    now_ts = time.time()
+    cooldown_until = st.session_state.get("cooldown_until", 0)
+    remaining = max(0, int(cooldown_until - now_ts))
+
+    # Placeholder para mostrar un contador en vivo
+    cooldown_placeholder = st.empty()
+
+    if remaining > 0:
+        # Contador regresivo en vivo (máx 60s para S1)
+        for sec in range(remaining, 0, -1):
+            cooldown_placeholder.warning(
+                "Se están actualizando datos desde KAME/Make. "
+                f"Espera aproximadamente {sec} segundos antes de ejecutar la predicción."
+            )
+            time.sleep(1)
+        # Al terminar el contador limpiamos estado y mensaje
+        cooldown_placeholder.empty()
+        st.session_state["cooldown_until"] = 0
+        remaining = 0
+        st.rerun()  # Recargar para quitar el mensaje
+
+    st.markdown("")
+
     col1, col2, col3 = st.columns(3)
     freq_label = col1.selectbox("Frecuencia", ["Mensual (M)", "Semanal (W)"], index=0)
     horizon    = col2.slider("Horizonte (períodos)", 2, 24, 6, 1)
@@ -1148,6 +1187,41 @@ elif modulo_activo == "Ventas":
         # Métricas rápidas
         total_hist = float(ventas_ext["venta_neta"].sum())
         sku_count  = int(ventas_ext["sku"].nunique())
+        
+        # Debug: Información sobre la lectura de datos
+        with st.expander("🔍 Información de depuración (lectura de datos)", expanded=False):
+            st.write("**Columnas del sheet original:**")
+            st.write(list(ventas_raw.columns))
+            st.write(f"**Filas en sheet original:** {len(ventas_raw)}")
+            
+            # Verificar qué columna se usó para venta_neta
+            cols_lc = {str(c).lower(): c for c in ventas_raw.columns}
+            def _col(*candidates):
+                for key in candidates:
+                    key_lc = key.lower()
+                    if key_lc in cols_lc:
+                        return cols_lc[key_lc]
+                return None
+            venta_col = _col("venta_neta", "total_linea", "total línea", "total_line")
+            if venta_col:
+                st.success(f"✅ Columna de venta encontrada: **{venta_col}**")
+                total_raw = pd.to_numeric(ventas_raw[venta_col], errors="coerce").fillna(0.0).sum()
+                st.write(f"**Total en columna '{venta_col}' del sheet:** ${total_raw:,.0f}")
+            else:
+                st.warning("⚠️ **No se encontró columna de venta_neta**. Se buscó: 'venta_neta', 'total_linea', 'total línea', 'total_line'")
+                st.write("**Columnas disponibles:**", list(ventas_raw.columns))
+            
+            st.write(f"**Filas después de normalización:** {len(ventas_ext)}")
+            st.write(f"**Filas descartadas (sin fecha o SKU válido):** {len(ventas_raw) - len(ventas_ext)}")
+            st.write(f"**Total venta_neta después de normalización:** ${total_hist:,.0f}")
+            
+            # Verificar si hay valores cero
+            zeros = (ventas_ext["venta_neta"] == 0.0).sum()
+            st.write(f"**Filas con venta_neta = 0:** {zeros} de {len(ventas_ext)}")
+            
+            # Mostrar muestra de datos normalizados
+            st.write("**Muestra de datos normalizados (primeras 5 filas):**")
+            st.dataframe(ventas_ext[["fecha", "sku", "venta_neta"]].head(), use_container_width=True)
 
         # Mejora #5: Indicador de estacionalidad aplicada
         if estacionalidad_aplicada:
