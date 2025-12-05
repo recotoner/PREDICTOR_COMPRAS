@@ -40,7 +40,7 @@ REPORT_APP_URL = "http://localhost:8504"
 
 # HENRY: tiempos de espera recomendados después de S1/S2/S3 (en segundos)
 COOLDOWN_S1 = 60   # ventas
-COOLDOWN_S2 = 90   # stock total
+COOLDOWN_S2 = 180   # stock total
 COOLDOWN_S3 = 30   # inbound
 
 # ======================================
@@ -719,7 +719,7 @@ if modulo_activo == "Compras":
                 {"reason": "ui_run", "tenant_id": TENANT_ID, "use_stock_total": True},
             )
             if resp.get("ok"):
-                st.success("Actualización de stock total enviada. Espera ~90 segundos antes de ejecutar la predicción.")
+                st.success("Actualización de stock total enviada. Espera ~180 segundos antes de ejecutar la predicción.")
                 start_cooldown(COOLDOWN_S2)
             else:
                 st.error(
