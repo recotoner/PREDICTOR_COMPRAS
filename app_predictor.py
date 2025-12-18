@@ -738,7 +738,16 @@ def _get_last_update_timestamp(sheet_id: str, update_type: str) -> Optional[pd.T
                         break
 
         if ts_found is not None and pd.notna(ts_found):
-            return ts_found
+            # HENRY: Asegurar que el timestamp retornado sea consciente de la zona horaria de Chile
+            # Si es naive (lo normal desde Sheets), lo localizamos. Si ya tiene TZ, lo convertimos.
+            try:
+                tz_chile = "America/Santiago"
+                if ts_found.tzinfo is None:
+                    return ts_found.tz_localize(tz_chile, ambiguous='infer')
+                else:
+                    return ts_found.tz_convert(tz_chile)
+            except Exception:
+                return ts_found # Fallback al original si falla la localización
                     
     except Exception:
         pass
@@ -802,39 +811,37 @@ def _get_update_status(sheet_id: str, update_type: str) -> Optional[str]:
 def _get_elapsed_time_info(ts: Optional[pd.Timestamp]) -> str:
     """
     Calcula el tiempo transcurrido desde un timestamp hasta ahora,
-    usando explícitamente la zona horaria de Chile.
+    forzando el uso de la zona horaria de Chile (America/Santiago).
+    
+    Esta función está diseñada para ser consistente tanto en local 
+    como en producción (Render/UTC).
     """
     if ts is None or pd.isna(ts):
         return "No disponible"
     
     try:
-        # Zona horaria de Chile
         tz_chile = "America/Santiago"
         
-        # 1. Asegurar que el timestamp sea un objeto Timestamp de pandas
+        # 1. Asegurar objeto Timestamp
         ts = pd.Timestamp(ts)
         
-        # 2. Obtener hora actual en Chile (consciente de zona horaria)
-        # Usamos un método más directo para evitar problemas de versiones
+        # 2. Localizar timestamp del sheet (si es naive, es Chile; si aware, convertir a Chile)
+        if ts.tzinfo is None:
+            ts_chile_aware = ts.tz_localize(tz_chile, ambiguous='infer')
+        else:
+            ts_chile_aware = ts.tz_convert(tz_chile)
+            
+        # 3. Obtener "ahora" explícitamente en Chile
         ahora_chile = pd.Timestamp.now(tz=tz_chile)
         
-        # 3. Normalizar el timestamp del sheet a la zona horaria de Chile
-        if ts.tzinfo is None:
-            # Si no tiene zona horaria, asumimos que es hora de Chile
-            ts_aware = ts.tz_localize(tz_chile, ambiguous='infer')
-        else:
-            # Si ya tiene, la convertimos a Chile
-            ts_aware = ts.tz_convert(tz_chile)
-            
         # 4. Calcular diferencia
-        diff = ahora_chile - ts_aware
+        diff = ahora_chile - ts_chile_aware
         total_seconds = diff.total_seconds()
         
+        # Manejo de casos de borde (relojes ligeramente desincronizados)
         if total_seconds < -60:
-            # Si el timestamp es futuro (más de 1 min), algo está raro con los relojes
             return "recién actualizado"
         elif total_seconds < 0:
-            # Pequeñas diferencias negativas son normales por sincronización
             return "hace unos momentos"
             
         horas = int(total_seconds // 3600)
@@ -846,12 +853,22 @@ def _get_elapsed_time_info(ts: Optional[pd.Timestamp]) -> str:
             return f"{minutos}m"
         else:
             return "hace unos momentos"
-    except Exception as e:
-        # En lugar de solo decir "No disponible", intentamos una resta naive como último recurso
+            
+    except Exception:
+        # Fallback ultra-seguro: intentar resta naive asumiendo que ambos son la misma zona
         try:
-            ahora_naive = pd.Timestamp.now()
+            # Si falló lo anterior, intentamos una comparación sin zonas horarias
+            # para evitar el desfase de horas del servidor
             ts_naive = ts.replace(tzinfo=None) if hasattr(ts, 'replace') else ts
-            diff = ahora_naive - ts_naive
+            # En Render, pd.Timestamp.now() es UTC. Si el sheet es Chile (UTC-3), 
+            # la resta naive daría error de ~3h.
+            # Por eso, para el fallback, tratamos de forzar la resta local.
+            import datetime
+            import pytz
+            chile_tz = pytz.timezone("America/Santiago")
+            now_chile = datetime.datetime.now(chile_tz).replace(tzinfo=None)
+            
+            diff = now_chile - ts_naive
             total_seconds = diff.total_seconds()
             horas = int(total_seconds // 3600)
             minutos = int((total_seconds % 3600) // 60)
