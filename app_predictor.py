@@ -2,7 +2,7 @@
 # Ejecuta:
 #   streamlit run app_predictor.py
 
-import os, time, requests, re, unicodedata
+import os, time, requests, re, unicodedata, hashlib, json
 import pandas as pd
 import streamlit as st
 from urllib.parse import quote
@@ -31,7 +31,7 @@ TAB_INBOUND        = "inbound_po"
 TAB_CLIENTES_CONF  = "clientes_config"
 
 # Webhooks Make por defecto (3 escenarios)
-DEFAULT_MAKE_WEBHOOK_S1_URL = "https://hook.us1.make.com/1pdchxe8cl7qg2oo7byqi4u5x4p9cc4n"
+DEFAULT_MAKE_WEBHOOK_S1_URL = "https://hook.us1.make.com/qfr459tm0yth3xjbsjl3ef7vq3m44hwv"
 DEFAULT_MAKE_WEBHOOK_S2_URL = "https://hook.us1.make.com/vdj87rfcjpmeuccds9vieu45410tnsug"
 DEFAULT_MAKE_WEBHOOK_S3_URL = "https://hook.us1.make.com/k50t6u1rtrswqd6vl4s8mqf2ndu6noa3"
 
@@ -39,8 +39,8 @@ DEFAULT_MAKE_WEBHOOK_S3_URL = "https://hook.us1.make.com/k50t6u1rtrswqd6vl4s8mqf
 REPORT_APP_URL = "http://localhost:8504"
 
 # HENRY: tiempos de espera recomendados después de S1/S2/S3 (en segundos)
-COOLDOWN_S1 = 60   # ventas
-COOLDOWN_S2 = 180   # stock total
+COOLDOWN_S1 = 180   # ventas
+COOLDOWN_S2 = 240   # stock total
 COOLDOWN_S3 = 30   # inbound
 
 # ======================================
@@ -290,9 +290,44 @@ def read_gsheets(sheet_id: str, tab: str) -> pd.DataFrame:
     if OFFLINE:
         return pd.read_csv(os.path.join(BASE, f"{tab}.csv"))
     sheet_param = quote(tab, safe="")
+    
+    # IMPORTANTE: Google Sheets a veces no exporta correctamente valores con corchetes [2A] cuando están en formato "Automático"
+    # Solución: Leer el CSV directamente con requests para ver qué está devolviendo realmente
     url = (f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?"
            f"tqx=out:csv&sheet={sheet_param}")
-    return pd.read_csv(url)
+    
+    try:
+        # Intentar leer directamente con requests para debug
+        response = requests.get(url, timeout=30)
+        response.encoding = 'utf-8'
+        csv_content = response.text
+        
+        # Leer desde el contenido CSV en memoria
+        from io import StringIO
+        df = pd.read_csv(
+            StringIO(csv_content),
+            dtype=str, 
+            na_filter=False, 
+            keep_default_na=False,
+            on_bad_lines='skip',
+            engine='python'
+        )
+    except Exception as e:
+        # Fallback: método directo si falla
+        df = pd.read_csv(
+            url, 
+            dtype=str, 
+            na_filter=False, 
+            keep_default_na=False,
+            encoding='utf-8',
+            on_bad_lines='skip',
+            engine='python'
+        )
+    
+    # Limpiar: reemplazar representaciones de NaN/None por string vacío
+    df = df.replace(['nan', 'NaN', 'None', '<NA>', 'NaT', 'null', 'NULL'], '')
+    
+    return df
 
 @st.cache_data(ttl=300)
 def load_clientes_config() -> Optional[pd.DataFrame]:
@@ -327,17 +362,27 @@ def _is_numeric_col(s: pd.Series) -> bool:
     return pd.to_numeric(s, errors="coerce").notna().sum() > 0
 
 def normalize_ventas_sheet(df: pd.DataFrame) -> pd.DataFrame:
-    cols_lc = {c.lower(): c for c in df.columns}
-    fecha_col = cols_lc.get("fecha")
-    sku_col   = cols_lc.get("sku")
-    qty_col   = cols_lc.get("cantidad") or cols_lc.get("qty")
+    # Normalizar nombres de columnas: eliminar espacios y caracteres invisibles
+    cols_normalized = {str(c).replace("\u00a0", " ").strip().lower(): c for c in df.columns}
+    fecha_col = cols_normalized.get("fecha")
+    sku_col   = cols_normalized.get("sku")
+    qty_col   = cols_normalized.get("cantidad") or cols_normalized.get("qty")
     if not fecha_col or not sku_col or not qty_col:
         raise ValueError("ventas_raw debe tener columnas 'fecha', 'sku' y 'cantidad'.")
     out = pd.DataFrame()
     out["fecha"] = pd.to_datetime(df[fecha_col], errors="coerce")
-    out["sku"]   = df[sku_col].astype(str).str.strip().str.upper()
-    out["qty"]   = pd.to_numeric(df[qty_col], errors="coerce").fillna(0)
-    out = out.dropna(subset=["fecha", "sku"])
+    # Convertir SKU a string, manejando números y valores NaN correctamente
+    # Si el SKU es numérico (ej: 3010100111114.0), convertirlo a string sin el .0
+    # Si es NaN, convertirlo a string vacío y luego filtrarlo
+    sku_series = df[sku_col].astype(str)
+    # Reemplazar representaciones de NaN/None por string vacío
+    sku_series = sku_series.replace(['nan', 'NaN', 'None', '<NA>', 'NaT'], '')
+    # Si el SKU es un número con .0 al final (ej: "3010100111114.0"), remover el .0
+    sku_series = sku_series.str.replace(r'\.0$', '', regex=True)
+    out["sku"] = sku_series.str.strip().str.upper()
+    out["qty"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0)
+    # Filtrar filas con SKU vacío o fecha inválida
+    out = out[(out["sku"] != "") & (out["fecha"].notna())]
     return out
 
 # === NUEVO: normalizador extendido para Módulo Ventas ===
@@ -356,11 +401,12 @@ def normalize_ventas_for_sales(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=base_cols)
 
-    cols_lc = {str(c).lower(): c for c in df.columns}
+    # Normalizar nombres de columnas: eliminar espacios y caracteres invisibles
+    cols_lc = {str(c).replace("\u00a0", " ").strip().lower(): c for c in df.columns}
 
     def _col(*candidates):
         for key in candidates:
-            key_lc = key.lower()
+            key_lc = key.lower().strip()
             if key_lc in cols_lc:
                 return cols_lc[key_lc]
         return None
@@ -547,6 +593,45 @@ def trigger_make(url: str, payload: dict) -> dict:
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+# HENRY: helper para calcular cooldown dinámico basado en cantidad de SKUs
+def calculate_dynamic_cooldown(update_type: str, default_cooldown: int) -> int:
+    """
+    Calcula un cooldown dinámico basado en la cantidad de SKUs del snapshot.
+    
+    Relación observada:
+    - Hasta 500 SKUs: 2-3 minutos (180 segundos)
+    - 1000 SKUs: ~7 minutos (420 segundos)
+    
+    Args:
+        update_type: Tipo de actualización ("S1" o "S2")
+        default_cooldown: Cooldown por defecto si no hay snapshot o SKUs
+    
+    Returns:
+        Segundos de cooldown calculados
+    """
+    snapshot = st.session_state.get(f"snapshot_{update_type}")
+    if not snapshot or snapshot.get("unique_skus") is None:
+        return default_cooldown
+    
+    sku_count = snapshot.get("unique_skus", 0)
+    
+    # Fórmula basada en observaciones:
+    # - 500 SKUs → 180 segundos (3 minutos)
+    # - 1000 SKUs → 420 segundos (7 minutos)
+    # - Interpolación lineal con mínimo de 120 segundos (2 minutos)
+    
+    if sku_count <= 500:
+        # Hasta 500 SKUs: usar 3 minutos (180 segundos)
+        return 180
+    elif sku_count >= 1000:
+        # 1000+ SKUs: usar 7 minutos (420 segundos)
+        return 420
+    else:
+        # Entre 500 y 1000 SKUs: interpolación lineal
+        # Pendiente: (420 - 180) / (1000 - 500) = 0.48 segundos por SKU adicional
+        cooldown = 180 + (sku_count - 500) * 0.48
+        return int(cooldown)
+
 # HENRY: helper para manejar el cooldown del botón de predicción
 def start_cooldown(seconds: int):
     """Marca en sesión un tiempo mínimo antes de ejecutar la predicción."""
@@ -555,6 +640,721 @@ def start_cooldown(seconds: int):
     now_ts = time.time()
     current = st.session_state.get("cooldown_until", 0)
     st.session_state["cooldown_until"] = max(current, now_ts + seconds)
+
+# HENRY: helpers para detectar fallos en actualizaciones
+def _calculate_data_hash(df: pd.DataFrame, columns: list = None) -> str:
+    """
+    Calcula un hash MD5 de los datos para detectar cambios precisos.
+    Si se especifican columnas, solo usa esas columnas.
+    """
+    if df is None or df.empty:
+        return hashlib.md5(b"empty").hexdigest()
+    
+    # Si se especifican columnas, usar solo esas
+    if columns:
+        available_cols = [c for c in columns if c in df.columns]
+        if available_cols:
+            df_to_hash = df[available_cols].copy()
+        else:
+            df_to_hash = df.copy()
+    else:
+        df_to_hash = df.copy()
+    
+    # Convertir a string y calcular hash
+    # Usar valores ordenados para que el hash sea consistente
+    try:
+        # Ordenar por todas las columnas para consistencia
+        df_sorted = df_to_hash.sort_values(by=list(df_to_hash.columns)).reset_index(drop=True)
+        data_str = df_sorted.to_csv(index=False).encode('utf-8')
+    except Exception:
+        # Fallback: convertir a string sin ordenar
+        data_str = df_to_hash.to_csv(index=False).encode('utf-8')
+    
+    return hashlib.md5(data_str).hexdigest()
+
+def _get_last_update_timestamp(sheet_id: str, update_type: str) -> Optional[pd.Timestamp]:
+    """
+    Lee un timestamp de última actualización desde el sheet DEL TENANT ACTUAL.
+    
+    SEGURIDAD MULTI-TENANT CRÍTICA:
+    - Esta función SIEMPRE lee del sheet específico del tenant (sheet_id)
+    - Cada tenant tiene su propio Google Sheet y su propia pestaña 'config'
+    
+    REQUISITOS DETERMINÍSTICOS:
+    - S1 (Ventas) → config!H2 (columna index 7)
+    - S2 (Stock)  → config!I2 (columna index 8)
+    - S3 (Inbound)→ config!K2 (columna index 10)
+    
+    Args:
+        sheet_id: ID del Google Sheet del TENANT ACTUAL
+        update_type: Tipo de actualización ("S1", "S2" o "S3")
+    """
+    if not sheet_id or sheet_id.strip() == "":
+        return None
+    
+    try:
+        # Leer pestaña config
+        config_df = read_gsheets(sheet_id, TAB_CONFIG)
+        if config_df.empty:
+            return None
+            
+        # Determinar columna según el tipo (0-indexed, Row 2 del sheet = Row 0 del DF)
+        col_idx = -1
+        if update_type == "S1":
+            col_idx = 7  # Columna H
+        elif update_type == "S2":
+            col_idx = 8  # Columna I
+        elif update_type == "S3":
+            col_idx = 10 # Columna K
+            
+        if col_idx != -1 and len(config_df.columns) > col_idx:
+            if len(config_df) > 0:
+                ts_str = str(config_df.iloc[0, col_idx]).strip()
+                # Fallback "No disponible" implícito si to_datetime falla o es NaT
+                ts = pd.to_datetime(ts_str, errors="coerce")
+                if pd.notna(ts):
+                    return ts
+                    
+    except Exception:
+        pass
+        
+    return None
+
+def _get_update_status(sheet_id: str, update_type: str) -> Optional[str]:
+    """
+    Lee el estado de actualización (STATUS_FINAL) desde el sheet DEL TENANT ACTUAL.
+    
+    SEGURIDAD MULTI-TENANT CRÍTICA:
+    - Esta función SIEMPRE lee del sheet específico del tenant (sheet_id)
+    - NUNCA lee de un sheet global o de otro tenant
+    
+    Make.com debe escribir el estado en la pestaña 'config' del sheet del tenant:
+    - "RUNNING" cuando comienza la actualización
+    - "DONE" cuando realmente termina
+    
+    Args:
+        sheet_id: ID del Google Sheet del TENANT ACTUAL (debe venir de CURRENT_SHEET_ID)
+        update_type: Tipo de actualización ("S1", "S2" o "S3")
+    
+    Busca en la pestaña 'config' del sheet del tenant:
+    - Columna: 'STATUS_FINAL', 'status_final', 'status', 'estado'
+    
+    Retorna:
+    - "RUNNING" si está en ejecución
+    - "DONE" si terminó
+    - None si no existe o hay error
+    """
+    # Validación de seguridad: asegurar que sheet_id no esté vacío
+    if not sheet_id or sheet_id.strip() == "":
+        return None
+    
+    try:
+        config_df = read_gsheets(sheet_id, TAB_CONFIG)
+        if not config_df.empty:
+            cols_lc = {str(c).lower(): c for c in config_df.columns}
+            status_col = None
+            
+            # Buscar columnas de estado
+            for col_name in ["status_final", "status", "estado", "estado_final"]:
+                if col_name in cols_lc:
+                    status_col = cols_lc[col_name]
+                    break
+            
+            if status_col and len(config_df) > 0:
+                status_str = str(config_df.iloc[0][status_col]).strip().upper()
+                if status_str in ["RUNNING", "DONE"]:
+                    return status_str
+                # También aceptar variaciones
+                if "RUNNING" in status_str or "EJECUTANDO" in status_str:
+                    return "RUNNING"
+                if "DONE" in status_str or "COMPLETO" in status_str or "TERMINADO" in status_str:
+                    return "DONE"
+    except Exception:
+        pass
+    
+    return None
+
+# MODO BATCH: Función para verificar si el batch está listo (STATUS_FINAL == "DONE" y timestamp estable)
+def check_batch_ready(sheet_id: str) -> dict:
+    """
+    Verifica si el batch está listo para ejecutar predicción.
+    
+    Requisitos:
+    1. STATUS_FINAL == "DONE"
+    2. Timestamp de stock no cambia en 4 lecturas consecutivas
+    
+    Retorna:
+    - ready: bool
+    - message: str (mensaje para mostrar al usuario)
+    - status: str ("DONE", "RUNNING", "UNKNOWN")
+    """
+    if not sheet_id or not sheet_id.strip():
+        return {
+            "ready": False,
+            "message": "❌ Sheet ID no configurado",
+            "status": "UNKNOWN"
+        }
+    
+    # Si ya confirmamos que el batch está listo, verificar rápidamente que sigue listo
+    if st.session_state.get("batch_ready_confirmed", False):
+        current_timestamp = _get_last_update_timestamp(sheet_id, "S2")
+        confirmed_timestamp = st.session_state.get("batch_ready_timestamp")
+        
+        # Si el timestamp sigue siendo el mismo, el batch sigue listo
+        if current_timestamp is not None and confirmed_timestamp is not None:
+            if current_timestamp == confirmed_timestamp:
+                batch_status = _get_update_status(sheet_id, "S2")
+                if batch_status == "DONE":
+                    return {
+                        "ready": True,
+                        "message": "✅ Batch completado y verificado. Puedes ejecutar la predicción.",
+                        "status": "DONE"
+                    }
+            else:
+                # El timestamp cambió, reiniciar verificación
+                st.session_state["batch_ready_confirmed"] = False
+                st.session_state["batch_timestamp_readings"] = []
+    
+    # Si ya confirmamos que el batch está listo, verificar rápidamente que sigue listo
+    if st.session_state.get("batch_ready_confirmed", False):
+        current_timestamp = _get_last_update_timestamp(sheet_id, "S2")
+        confirmed_timestamp = st.session_state.get("batch_ready_timestamp")
+        
+        # Si el timestamp sigue siendo el mismo, el batch sigue listo
+        if current_timestamp is not None and confirmed_timestamp is not None:
+            if current_timestamp == confirmed_timestamp:
+                batch_status = _get_update_status(sheet_id, "S2")
+                if batch_status == "DONE":
+                    return {
+                        "ready": True,
+                        "message": "✅ Batch completado y verificado. Puedes ejecutar la predicción.",
+                        "status": "DONE"
+                    }
+            else:
+                # El timestamp cambió, reiniciar verificación
+                st.session_state["batch_ready_confirmed"] = False
+                st.session_state["batch_timestamp_readings"] = []
+    
+    # Verificar STATUS_FINAL
+    batch_status = _get_update_status(sheet_id, "S2")  # Usamos S2 para verificar el batch completo
+    
+    if batch_status != "DONE":
+        if batch_status == "RUNNING":
+            return {
+                "ready": False,
+                "message": "⏳ Actualización batch en curso (STATUS: RUNNING). Espera a que termine.",
+                "status": "RUNNING"
+            }
+        else:
+            return {
+                "ready": False,
+                "message": "⏳ Actualización batch en curso o no confirmada. STATUS_FINAL no disponible.",
+                "status": "UNKNOWN"
+            }
+    
+    # STATUS_FINAL == "DONE", ahora verificar estabilización del timestamp
+    # Leer timestamp actual de stock
+    current_timestamp = _get_last_update_timestamp(sheet_id, "S2")
+    
+    if current_timestamp is None:
+        return {
+            "ready": False,
+            "message": "⏳ Actualización batch en curso. Timestamp de stock no disponible.",
+            "status": "DONE"
+        }
+    
+    # Guardar lecturas en session_state para verificar estabilización
+    timestamp_readings_key = "batch_timestamp_readings"
+    if timestamp_readings_key not in st.session_state:
+        st.session_state[timestamp_readings_key] = []
+    
+    readings = st.session_state[timestamp_readings_key]
+    
+    # Limpiar lecturas muy antiguas (más de 1 minuto)
+    now = time.time()
+    readings = [r for r in readings if (now - r["time"]) < 60]
+    st.session_state[timestamp_readings_key] = readings
+    
+    # Solo agregar una nueva lectura si han pasado al menos 3 segundos desde la última
+    should_add_reading = True
+    if len(readings) > 0:
+        last_reading_time = readings[-1]["time"]
+        if (now - last_reading_time) < 3:
+            should_add_reading = False
+    
+    if should_add_reading:
+        # Agregar lectura actual
+        readings.append({
+            "timestamp": current_timestamp,
+            "time": now
+        })
+        st.session_state[timestamp_readings_key] = readings
+    
+    # Mantener solo las últimas 4 lecturas
+    if len(readings) > 4:
+        readings = readings[-4:]
+        st.session_state[timestamp_readings_key] = readings
+    
+    # Verificar si las últimas 4 lecturas son iguales
+    if len(readings) >= 4:
+        # Verificar que todos los timestamps sean iguales
+        first_ts = readings[0]["timestamp"]
+        all_same = all(r["timestamp"] == first_ts for r in readings)
+        
+        if all_same:
+            # Timestamp estabilizado, listo para ejecutar
+            # Guardar confirmación en session_state para evitar revalidar cuando se presiona el botón
+            st.session_state["batch_ready_confirmed"] = True
+            st.session_state["batch_ready_timestamp"] = current_timestamp
+            return {
+                "ready": True,
+                "message": "✅ Batch completado y verificado. Puedes ejecutar la predicción.",
+                "status": "DONE"
+            }
+        else:
+            # Timestamp aún está cambiando, reiniciar lecturas
+            st.session_state[timestamp_readings_key] = [readings[-1]]  # Mantener solo la última
+            return {
+                "ready": False,
+                "message": "⏳ Actualización batch en curso. Timestamp de stock aún se está actualizando.",
+                "status": "DONE"
+            }
+    else:
+        # Aún no tenemos 4 lecturas, esperar más
+        return {
+            "ready": False,
+            "message": f"⏳ Verificando estabilización del timestamp ({len(readings)}/4 lecturas)...",
+            "status": "DONE",
+            "needs_rerun": len(readings) > 0 and should_add_reading  # Indicar si necesita rerun
+        }
+
+def save_data_snapshot(sheet_id: str, update_type: str):
+    """
+    Guarda un snapshot de los datos antes de disparar una actualización.
+    
+    SEGURIDAD MULTI-TENANT: Esta función SIEMPRE debe recibir el sheet_id del tenant actual.
+    NUNCA debe leer de un sheet global o de otro tenant.
+    
+    Args:
+        sheet_id: ID del Google Sheet del TENANT ACTUAL (debe venir de CURRENT_SHEET_ID)
+        update_type: Tipo de actualización ("S1" o "S2")
+    """
+    # Validación de seguridad: asegurar que sheet_id no esté vacío
+    if not sheet_id or sheet_id.strip() == "":
+        st.error(f"❌ **ERROR DE SEGURIDAD**: sheet_id está vacío para {update_type}. No se puede guardar snapshot.")
+        return
+    
+    try:
+        if update_type == "S1":  # Ventas
+            ventas_raw = read_gsheets(sheet_id, TAB_VENTAS)
+            ventas = normalize_ventas_sheet(ventas_raw)
+            # Guardar estado inicial de STATUS_FINAL antes de disparar
+            initial_status = _get_update_status(sheet_id, update_type)
+            snapshot = {
+                "timestamp": time.time(),
+                "row_count": len(ventas_raw),
+                "last_date": None,
+                "total_qty": 0.0,
+                "data_hash": None,  # NUEVO: hash de los datos
+                "unique_skus": None,  # NUEVO: número de SKUs únicos para detectar actualizaciones incompletas
+                "initial_status": initial_status,  # Estado inicial de STATUS_FINAL antes de disparar
+            }
+            if not ventas.empty and "fecha" in ventas.columns:
+                snapshot["last_date"] = ventas["fecha"].max()
+                snapshot["total_qty"] = float(ventas["qty"].sum())
+                snapshot["unique_skus"] = int(ventas["sku"].nunique())  # Guardar número de SKUs únicos
+                # Calcular hash de los datos (usar columnas clave: fecha, sku, qty)
+                snapshot["data_hash"] = _calculate_data_hash(ventas, ["fecha", "sku", "qty"])
+            elif not ventas_raw.empty:
+                # Si hay datos pero no se pudieron normalizar, calcular hash del raw
+                snapshot["data_hash"] = _calculate_data_hash(ventas_raw)
+            st.session_state[f"snapshot_{update_type}"] = snapshot
+        elif update_type == "S2":  # Stock
+            stock_raw = read_gsheets(sheet_id, TAB_STOCK)
+            stock = normalize_stock_sheet(stock_raw)
+            # Guardar estado inicial de STATUS_FINAL antes de disparar
+            initial_status = _get_update_status(sheet_id, update_type)
+            snapshot = {
+                "timestamp": time.time(),
+                "row_count": len(stock_raw),
+                "total_stock": 0.0,
+                "data_hash": None,  # NUEVO: hash de los datos
+                "unique_skus": None,  # NUEVO: número de SKUs únicos para detectar actualizaciones incompletas
+                "initial_status": initial_status,  # Estado inicial de STATUS_FINAL antes de disparar
+            }
+            if not stock.empty and "stock" in stock.columns:
+                snapshot["total_stock"] = float(stock["stock"].sum())
+                snapshot["unique_skus"] = int(stock["sku"].nunique())  # Guardar número de SKUs únicos
+                # Calcular hash de los datos (usar columnas clave: sku, stock)
+                snapshot["data_hash"] = _calculate_data_hash(stock, ["sku", "stock"])
+            elif not stock_raw.empty:
+                # Si hay datos pero no se pudieron normalizar, calcular hash del raw
+                snapshot["data_hash"] = _calculate_data_hash(stock_raw)
+            st.session_state[f"snapshot_{update_type}"] = snapshot
+    except Exception as e:
+        # Si falla, guardamos un snapshot mínimo
+        st.session_state[f"snapshot_{update_type}"] = {
+            "timestamp": time.time(),
+            "error": str(e),
+        }
+
+def check_update_success(sheet_id: str, update_type: str, cooldown_seconds: int) -> dict:
+    """
+    Verifica si una actualización fue exitosa comparando con el snapshot anterior.
+    
+    SEGURIDAD MULTI-TENANT: Esta función SIEMPRE debe recibir el sheet_id del tenant actual.
+    NUNCA debe leer de un sheet global o de otro tenant.
+    
+    Usa múltiples métodos:
+    1. Hash de datos (más preciso)
+    2. Timestamp de última actualización (si existe en el sheet del tenant)
+    3. Comparación de métricas (fallback)
+    
+    Args:
+        sheet_id: ID del Google Sheet del TENANT ACTUAL (debe venir de CURRENT_SHEET_ID)
+        update_type: Tipo de actualización ("S1" o "S2")
+        cooldown_seconds: Segundos de cooldown esperados
+    
+    Retorna un dict con:
+    - success: bool (True si parece exitosa)
+    - warnings: list de mensajes de advertencia
+    - errors: list de mensajes de error
+    """
+    # Validación de seguridad: asegurar que sheet_id no esté vacío
+    if not sheet_id or sheet_id.strip() == "":
+        return {
+            "success": False,
+            "warnings": [],
+            "errors": [f"❌ **ERROR DE SEGURIDAD**: sheet_id está vacío para {update_type}. No se puede verificar actualización."],
+        }
+    
+    result = {
+        "success": True,
+        "warnings": [],
+        "errors": [],
+    }
+    
+    snapshot = st.session_state.get(f"snapshot_{update_type}")
+    if not snapshot:
+        result["warnings"].append("No se pudo verificar la actualización (no hay snapshot previo).")
+        return result
+    
+    # Si el snapshot tiene un error, no podemos verificar
+    if "error" in snapshot:
+        result["warnings"].append(f"No se pudo crear snapshot previo: {snapshot.get('error')}. La verificación se omitirá.")
+        return result
+    
+    try:
+        elapsed = time.time() - snapshot.get("timestamp", time.time())
+        snapshot_time = snapshot.get("timestamp", time.time())
+        
+        # PRIORIDAD 1: Verificar STATUS_FINAL (más confiable que timestamp)
+        # Make.com escribe "RUNNING" cuando comienza y "DONE" cuando realmente termina
+        # IMPORTANTE: Solo considerar "DONE" si el estado cambió desde el estado inicial
+        initial_status = snapshot.get("initial_status")
+        update_status = _get_update_status(sheet_id, update_type)
+        
+        if update_status == "DONE":
+            # Solo considerar completado si el estado cambió desde el inicial
+            # Si el estado inicial ya era "DONE", significa que es de una ejecución anterior
+            if initial_status != "DONE":
+                # El estado cambió a "DONE", pero verificar que el timestamp se haya estabilizado
+                # Si el timestamp sigue cambiando, Make.com aún está ejecutando
+                last_update_ts = _get_last_update_timestamp(sheet_id, update_type)
+                
+                # Guardar el timestamp cuando detectamos "DONE" por primera vez
+                done_timestamp_key = f"done_timestamp_{update_type}"
+                previous_done_timestamp = st.session_state.get(done_timestamp_key)
+                
+                if last_update_ts is not None:
+                    if previous_done_timestamp is None:
+                        # Primera vez que detectamos "DONE", guardar el timestamp
+                        st.session_state[done_timestamp_key] = last_update_ts
+                        result["warnings"].append(
+                            "⏳ Make.com reporta 'DONE', pero verificando que el timestamp se haya estabilizado. "
+                            "Esperando 15 segundos para confirmar..."
+                        )
+                        # No retornar todavía, continuar verificando
+                    else:
+                        # Ya habíamos detectado "DONE" antes, verificar si el timestamp cambió
+                        time_since_previous = (last_update_ts - previous_done_timestamp).total_seconds()
+                        
+                        if time_since_previous < 15:
+                            # El timestamp cambió recientemente (menos de 15 segundos), Make.com aún está ejecutando
+                            result["warnings"].append(
+                                f"⏳ Make.com reporta 'DONE', pero el timestamp sigue actualizándose "
+                                f"(último cambio hace {time_since_previous:.1f}s). "
+                                "Esperando a que se estabilice..."
+                            )
+                            # Actualizar el timestamp guardado
+                            st.session_state[done_timestamp_key] = last_update_ts
+                            # No retornar todavía, continuar verificando
+                        else:
+                            # El timestamp se estabilizó (no cambió en los últimos 15 segundos), realmente terminó
+                            result["success"] = True
+                            # Limpiar el timestamp guardado
+                            if done_timestamp_key in st.session_state:
+                                del st.session_state[done_timestamp_key]
+                            # Detener el cooldown ya que Make.com realmente terminó
+                            st.session_state["cooldown_until"] = 0
+                            return result
+                else:
+                    # No hay timestamp disponible, confiar en el estado "DONE" pero esperar un poco más
+                    if previous_done_timestamp is None:
+                        # Primera vez que detectamos "DONE", guardar el tiempo actual
+                        st.session_state[done_timestamp_key] = time.time()
+                        result["warnings"].append(
+                            "⏳ Make.com reporta 'DONE', pero no hay timestamp disponible. "
+                            "Esperando 15 segundos para confirmar..."
+                        )
+                    else:
+                        # Verificar si pasaron al menos 15 segundos desde que detectamos "DONE"
+                        time_since_done = time.time() - previous_done_timestamp
+                        if time_since_done >= 15:
+                            # Pasaron 15 segundos, considerar completado
+                            result["success"] = True
+                            if done_timestamp_key in st.session_state:
+                                del st.session_state[done_timestamp_key]
+                            st.session_state["cooldown_until"] = 0
+                            return result
+            else:
+                # El estado ya era "DONE" antes de presionar el botón
+                # Esto es normal al inicio: Make.com puede tardar unos segundos en cambiar a "RUNNING"
+                # Solo mostrar warning si ha pasado suficiente tiempo (más de 15 segundos)
+                if elapsed > 15:
+                    result["warnings"].append(
+                        "ℹ️ El estado STATUS_FINAL aún muestra 'DONE' de una ejecución anterior. "
+                        "Make.com debería cambiar a 'RUNNING' pronto. Verificando datos..."
+                    )
+                # Si es muy reciente (menos de 15 segundos), no mostrar warning, es normal
+        elif update_status == "RUNNING":
+            # Make.com está ejecutando, esperar a que termine
+            result["warnings"].append(
+                "⏳ Make.com está ejecutando la actualización (STATUS: RUNNING). "
+                "Esperando a que termine antes de verificar los datos."
+            )
+            # No retornar todavía, continuar con otras verificaciones pero no marcar como exitoso
+        
+        # MEJORA #2: Verificar timestamp de última actualización desde el sheet (si Make.com lo escribe)
+        last_update_ts = _get_last_update_timestamp(sheet_id, update_type)
+        if last_update_ts is not None:
+            # Si existe timestamp en el sheet, verificar que sea más reciente que el snapshot
+            snapshot_datetime = pd.Timestamp.fromtimestamp(snapshot_time)
+            if last_update_ts > snapshot_datetime:
+                # La actualización fue exitosa según el timestamp del sheet
+                result["success"] = True
+                # No agregar warnings adicionales si el timestamp confirma éxito
+                return result
+            else:
+                # El timestamp no es más reciente, puede haber un problema
+                result["warnings"].append(
+                    f"⚠️ El timestamp de última actualización en el sheet ({last_update_ts.strftime('%Y-%m-%d %H:%M:%S')}) "
+                    f"no es más reciente que cuando se inició la actualización. "
+                    f"Es posible que la actualización no se haya completado."
+                )
+        
+        if update_type == "S1":  # Ventas
+            ventas_raw = read_gsheets(sheet_id, TAB_VENTAS)
+            ventas = normalize_ventas_sheet(ventas_raw)
+            
+            # Definir variables de conteo ANTES de usarlas
+            current_rows = len(ventas_raw)
+            previous_rows = snapshot.get("row_count", 0)
+            
+            # MEJORA #2: Comparar hash de datos (más preciso que comparar totales)
+            previous_hash = snapshot.get("data_hash")
+            if previous_hash:
+                if not ventas.empty:
+                    current_hash = _calculate_data_hash(ventas, ["fecha", "sku", "qty"])
+                elif not ventas_raw.empty:
+                    current_hash = _calculate_data_hash(ventas_raw)
+                else:
+                    current_hash = None
+                
+                if current_hash == previous_hash:
+                    # Los datos son idénticos
+                    if elapsed > cooldown_seconds * 0.8:  # Pasó al menos 80% del cooldown
+                        result["warnings"].append(
+                            "⚠️ Los datos de ventas son idénticos a antes de la actualización (verificado por hash). "
+                            "Es muy probable que la actualización no se haya completado correctamente."
+                        )
+                else:
+                    # Los datos cambiaron, pero verificar si es una actualización completa o parcial
+                    # Si hay menos filas que antes, podría ser una actualización incompleta
+                    if previous_rows > 0 and current_rows < previous_rows:
+                        reduction_pct = ((previous_rows - current_rows) / previous_rows) * 100
+                        if reduction_pct > 5.0:
+                            result["warnings"].append(
+                                f"⚠️ **ATENCIÓN**: Los datos cambiaron (hash diferente), pero el número de filas "
+                                f"disminuyó desde {previous_rows} a {current_rows} ({reduction_pct:.1f}% de reducción). "
+                                f"Esto podría indicar una actualización parcial o incompleta (ej: error 429 en Make.com)."
+                            )
+                    else:
+                        # Los datos cambiaron y no hay reducción significativa, actualización probablemente exitosa
+                        result["success"] = True
+            
+            # Verificar cambios en número de filas
+            
+            # DETECCIÓN DE ACTUALIZACIÓN INCOMPLETA: Reducción significativa de filas
+            # Si hay menos filas después de una actualización, podría ser un problema
+            if previous_rows > 0 and current_rows < previous_rows:
+                reduction_pct = ((previous_rows - current_rows) / previous_rows) * 100
+                # Si se redujo más del 5%, podría ser una actualización incompleta
+                if reduction_pct > 5.0 and elapsed > cooldown_seconds * 0.8:
+                    result["warnings"].append(
+                        f"⚠️ **POSIBLE ACTUALIZACIÓN INCOMPLETA**: El número de filas disminuyó significativamente "
+                        f"desde {previous_rows} a {current_rows} ({reduction_pct:.1f}% de reducción). "
+                        f"Esto podría indicar que la actualización se detuvo antes de completarse (ej: error 429 en Make.com)."
+                    )
+            
+            # Verificar número de SKUs únicos (otra señal de actualización incompleta)
+            if not ventas.empty and "sku" in ventas.columns:
+                current_skus = ventas["sku"].nunique()
+                # Si tenemos el snapshot anterior con SKUs, comparar
+                previous_skus = snapshot.get("unique_skus")
+                if previous_skus and current_skus < previous_skus:
+                    reduction_skus = ((previous_skus - current_skus) / previous_skus) * 100
+                    if reduction_skus > 5.0 and elapsed > cooldown_seconds * 0.8:
+                        result["warnings"].append(
+                            f"⚠️ **POSIBLE ACTUALIZACIÓN INCOMPLETA**: El número de SKUs únicos disminuyó "
+                            f"desde {previous_skus} a {current_skus} ({reduction_skus:.1f}% de reducción). "
+                            f"Esto podría indicar que faltan datos de algunos SKUs."
+                        )
+            
+            # Verificar última fecha
+            current_last_date = None
+            if not ventas.empty and "fecha" in ventas.columns:
+                current_last_date = ventas["fecha"].max()
+                previous_last_date = snapshot.get("last_date")
+                
+                # Verificar antigüedad de datos (última fecha debe ser reciente)
+                if current_last_date is not None:
+                    hoy = pd.Timestamp.today().normalize()
+                    dias_desde_ultima = (hoy - current_last_date).days
+                    if dias_desde_ultima > 7:  # Más de 7 días sin datos nuevos
+                        result["warnings"].append(
+                            f"⚠️ Los datos de ventas parecen antiguos. "
+                            f"Última fecha registrada: {current_last_date.strftime('%Y-%m-%d')} "
+                            f"(hace {dias_desde_ultima} días)."
+                        )
+                
+                # Comparar con snapshot anterior
+                if previous_last_date is not None and current_last_date is not None:
+                    if current_last_date <= previous_last_date:
+                        result["warnings"].append(
+                            f"⚠️ La última fecha de ventas no ha cambiado desde la actualización. "
+                            f"Última fecha: {current_last_date.strftime('%Y-%m-%d')}."
+                        )
+            
+            # Verificar cambios significativos en cantidad total (fallback si no hay hash)
+            if not previous_hash:
+                current_total = float(ventas["qty"].sum()) if not ventas.empty else 0.0
+                previous_total = snapshot.get("total_qty", 0.0)
+                
+                # Si no hay cambios y pasó suficiente tiempo, puede ser un problema
+                if abs(current_total - previous_total) < 0.01 and current_rows == previous_rows:
+                    if elapsed > cooldown_seconds * 0.8:  # Pasó al menos 80% del cooldown
+                        result["warnings"].append(
+                            "⚠️ No se detectaron cambios en los datos de ventas después de la actualización. "
+                            "Es posible que la actualización no se haya completado correctamente."
+                        )
+            
+        elif update_type == "S2":  # Stock
+            stock_raw = read_gsheets(sheet_id, TAB_STOCK)
+            stock = normalize_stock_sheet(stock_raw)
+            
+            # Definir variables de conteo ANTES de usarlas
+            current_rows = len(stock_raw)
+            previous_rows = snapshot.get("row_count", 0)
+            
+            # MEJORA #2: Comparar hash de datos (más preciso que comparar totales)
+            previous_hash = snapshot.get("data_hash")
+            if previous_hash:
+                if not stock.empty:
+                    current_hash = _calculate_data_hash(stock, ["sku", "stock"])
+                elif not stock_raw.empty:
+                    current_hash = _calculate_data_hash(stock_raw)
+                else:
+                    current_hash = None
+                
+                if current_hash == previous_hash:
+                    # Los datos son idénticos
+                    if elapsed > cooldown_seconds * 0.8:  # Pasó al menos 80% del cooldown
+                        result["warnings"].append(
+                            "⚠️ Los datos de stock son idénticos a antes de la actualización (verificado por hash). "
+                            "Es muy probable que la actualización no se haya completado correctamente."
+                        )
+                else:
+                    # Los datos cambiaron, pero verificar si es una actualización completa o parcial
+                    # Si hay menos filas que antes, podría ser una actualización incompleta
+                    if previous_rows > 0 and current_rows < previous_rows:
+                        reduction_pct = ((previous_rows - current_rows) / previous_rows) * 100
+                        if reduction_pct > 5.0:
+                            result["warnings"].append(
+                                f"⚠️ **ATENCIÓN**: Los datos cambiaron (hash diferente), pero el número de filas "
+                                f"disminuyó desde {previous_rows} a {current_rows} ({reduction_pct:.1f}% de reducción). "
+                                f"Esto podría indicar una actualización parcial o incompleta (ej: error 429 en Make.com)."
+                            )
+                    else:
+                        # Los datos cambiaron y no hay reducción significativa, actualización probablemente exitosa
+                        result["success"] = True
+            
+            # Verificar cambios en número de filas
+            
+            # DETECCIÓN DE ACTUALIZACIÓN INCOMPLETA: Reducción significativa de filas
+            # Si hay menos filas después de una actualización, podría ser un problema
+            if previous_rows > 0 and current_rows < previous_rows:
+                reduction_pct = ((previous_rows - current_rows) / previous_rows) * 100
+                # Si se redujo más del 5%, podría ser una actualización incompleta
+                if reduction_pct > 5.0 and elapsed > cooldown_seconds * 0.8:
+                    result["warnings"].append(
+                        f"⚠️ **POSIBLE ACTUALIZACIÓN INCOMPLETA**: El número de filas de stock disminuyó significativamente "
+                        f"desde {previous_rows} a {current_rows} ({reduction_pct:.1f}% de reducción). "
+                        f"Esto podría indicar que la actualización se detuvo antes de completarse (ej: error 429 en Make.com)."
+                    )
+            
+            # Verificar número de SKUs únicos en stock (otra señal de actualización incompleta)
+            if not stock.empty and "sku" in stock.columns:
+                current_skus = stock["sku"].nunique()
+                previous_skus = snapshot.get("unique_skus")
+                if previous_skus and current_skus < previous_skus:
+                    reduction_skus = ((previous_skus - current_skus) / previous_skus) * 100
+                    if reduction_skus > 5.0 and elapsed > cooldown_seconds * 0.8:
+                        result["warnings"].append(
+                            f"⚠️ **POSIBLE ACTUALIZACIÓN INCOMPLETA**: El número de SKUs únicos en stock disminuyó "
+                            f"desde {previous_skus} a {current_skus} ({reduction_skus:.1f}% de reducción). "
+                            f"Esto podría indicar que faltan datos de algunos SKUs."
+                        )
+            
+            # Verificar cambios en stock total (fallback si no hay hash)
+            if not previous_hash:
+                current_total = float(stock["stock"].sum()) if not stock.empty else 0.0
+                previous_total = snapshot.get("total_stock", 0.0)
+                
+                # Si no hay cambios y pasó suficiente tiempo, puede ser un problema
+                if abs(current_total - previous_total) < 0.01 and current_rows == previous_rows:
+                    if elapsed > cooldown_seconds * 0.8:  # Pasó al menos 80% del cooldown
+                        result["warnings"].append(
+                            "⚠️ No se detectaron cambios en los datos de stock después de la actualización. "
+                            "Es posible que la actualización no se haya completado correctamente."
+                        )
+            
+            # Verificar si el stock está vacío (puede ser un error)
+            if stock.empty:
+                result["errors"].append(
+                    "❌ ERROR: Los datos de stock están vacíos. La actualización puede haber fallado."
+                )
+                result["success"] = False
+        
+        # Si hay errores, marcar como no exitoso
+        if result["errors"]:
+            result["success"] = False
+            
+    except Exception as e:
+        result["errors"].append(f"❌ Error al verificar actualización: {str(e)}")
+        result["success"] = False
+    
+    return result
 
 # ======================================
 # CARGA CONFIG CLIENTES
@@ -639,9 +1439,22 @@ TENANT_NAME = st.session_state.get("TENANT_NAME", "default")
 TENANT_ID   = st.session_state.get("TENANT_ID", "default")
 TENANT_ROW  = st.session_state.get("TENANT_ROW", {})
 
-CURRENT_SHEET_ID   = TENANT_ROW.get("sheet_id", DEFAULT_SHEET_ID) if TENANT_ROW else DEFAULT_SHEET_ID
-KAME_CLIENT_ID     = TENANT_ROW.get("kame_client_id", "")
-KAME_CLIENT_SECRET = TENANT_ROW.get("kame_client_secret", "")
+# SEGURIDAD MULTI-TENANT: CURRENT_SHEET_ID siempre debe venir del tenant actual
+# NUNCA usar DEFAULT_SHEET_ID como fallback en producción multi-tenant
+if TENANT_ROW and TENANT_ROW.get("sheet_id"):
+    CURRENT_SHEET_ID = str(TENANT_ROW.get("sheet_id")).strip()
+    if not CURRENT_SHEET_ID:
+        # Si sheet_id está vacío, usar default solo en modo desarrollo
+        CURRENT_SHEET_ID = DEFAULT_SHEET_ID
+        st.warning("⚠️ **ADVERTENCIA DE SEGURIDAD**: El tenant no tiene sheet_id configurado. Usando sheet por defecto.")
+else:
+    # Solo usar DEFAULT_SHEET_ID si no hay tenant configurado (modo desarrollo/single-tenant)
+    CURRENT_SHEET_ID = DEFAULT_SHEET_ID
+    if TENANT_ROW:
+        st.error("❌ **ERROR DE SEGURIDAD**: El tenant está configurado pero no tiene sheet_id. No se pueden leer datos.")
+
+KAME_CLIENT_ID     = TENANT_ROW.get("kame_client_id", "") if TENANT_ROW else ""
+KAME_CLIENT_SECRET = TENANT_ROW.get("kame_client_secret", "") if TENANT_ROW else ""
 USE_STOCK_TOTAL    = _truthy(TENANT_ROW.get("use_stock_total", False)) if TENANT_ROW else False
 
 # Flags de módulos (Compras / Ventas) leídos desde clientes_config
@@ -698,47 +1511,139 @@ if modulo_activo == "Compras":
     st.caption(f"Fuente de datos: **{modo_datos}** — Tenant: **{TENANT_NAME}**")
 
     # --------------------------------------
-    # BOTONES SUPERIORES
+    # BOTONES SUPERIORES (DESHABILITADOS - MODO BATCH)
     # --------------------------------------
+    # MODO BATCH: Los botones S1, S2, S3 están deshabilitados
+    # Las actualizaciones se ejecutan automáticamente por batch
     bt1, bt2, bt3 = st.columns(3)
     with bt1:
-        if st.button("📘 Actualizar ventas (S1)", use_container_width=True):
-            resp = trigger_make(MAKE_WEBHOOK_S1_URL, {"reason": "ui_run", "tenant_id": TENANT_ID})
-            if resp.get("ok"):
-                st.success("Actualización de ventas enviada a Make. Espera ~60 segundos antes de ejecutar la predicción.")
-                start_cooldown(COOLDOWN_S1)
-            else:
-                st.error(
-                    f"No se pudo actualizar ventas (S1). "
-                    f"Código: {resp.get('status')}, detalle: {resp.get('error') or resp.get('text')}"
-                )
+        st.button("📘 Actualizar ventas (S1)", use_container_width=True, disabled=True, help="Modo BATCH: Las actualizaciones se ejecutan automáticamente")
+        # CÓDIGO COMENTADO - MODO BATCH
+        # if st.button("📘 Actualizar ventas (S1)", use_container_width=True):
+        #     if not CURRENT_SHEET_ID or not CURRENT_SHEET_ID.strip():
+        #         st.error("❌ **ERROR DE SEGURIDAD**: No se puede actualizar ventas. CURRENT_SHEET_ID no está configurado correctamente.")
+        #     else:
+        #         save_data_snapshot(CURRENT_SHEET_ID, "S1")
+        #         resp = trigger_make(MAKE_WEBHOOK_S1_URL, {"reason": "ui_run", "tenant_id": TENANT_ID})
+        #         if resp.get("ok"):
+        #             st.success(f"Actualización de ventas enviada a Make. Espera ~{COOLDOWN_S1} segundos antes de ejecutar la predicción.")
+        #             start_cooldown(COOLDOWN_S1)
+        #         else:
+        #             st.error(
+        #                 f"No se pudo actualizar ventas (S1). "
+        #                 f"Código: {resp.get('status')}, detalle: {resp.get('error') or resp.get('text')}"
+        #             )
     with bt2:
-        if st.button("📦 Actualizar stock total (S2)", use_container_width=True):
-            resp = trigger_make(
-                MAKE_WEBHOOK_S2_URL,
-                {"reason": "ui_run", "tenant_id": TENANT_ID, "use_stock_total": True},
-            )
-            if resp.get("ok"):
-                st.success("Actualización de stock total enviada. Espera ~180 segundos antes de ejecutar la predicción.")
-                start_cooldown(COOLDOWN_S2)
-            else:
-                st.error(
-                    f"No se pudo actualizar stock (S2). "
-                    f"Código: {resp.get('status')}, detalle: {resp.get('error') or resp.get('text')}"
-                )
+        st.button("📦 Actualizar stock total (S2)", use_container_width=True, disabled=True, help="Modo BATCH: Las actualizaciones se ejecutan automáticamente")
+        # CÓDIGO COMENTADO - MODO BATCH
+        # if st.button("📦 Actualizar stock total (S2)", use_container_width=True):
+        #     if not CURRENT_SHEET_ID or not CURRENT_SHEET_ID.strip():
+        #         st.error("❌ **ERROR DE SEGURIDAD**: No se puede actualizar stock. CURRENT_SHEET_ID no está configurado correctamente.")
+        #     else:
+        #         save_data_snapshot(CURRENT_SHEET_ID, "S2")
+        #         resp = trigger_make(
+        #             MAKE_WEBHOOK_S2_URL,
+        #             {"reason": "ui_run", "tenant_id": TENANT_ID, "use_stock_total": True},
+        #         )
+        #         if resp.get("ok"):
+        #             dynamic_cooldown = calculate_dynamic_cooldown("S2", COOLDOWN_S2)
+        #             minutos = dynamic_cooldown // 60
+        #             segundos = dynamic_cooldown % 60
+        #             if minutos > 0:
+        #                 tiempo_str = f"{minutos} minuto{'s' if minutos > 1 else ''}"
+        #                 if segundos > 0:
+        #                     tiempo_str += f" {segundos} segundo{'s' if segundos > 1 else ''}"
+        #             else:
+        #                 tiempo_str = f"{segundos} segundo{'s' if segundos > 1 else ''}"
+        #             st.success(f"Actualización de stock total enviada. Espera ~{tiempo_str} antes de ejecutar la predicción.")
+        #             start_cooldown(dynamic_cooldown)
+        #         else:
+        #             st.error(
+        #                 f"No se pudo actualizar stock (S2). "
+        #                 f"Código: {resp.get('status')}, detalle: {resp.get('error') or resp.get('text')}"
+        #             )
     with bt3:
-        if st.button("🧾 Actualizar inbound (S3)", use_container_width=True):
-            resp = trigger_make(MAKE_WEBHOOK_S3_URL, {"reason": "ui_run", "tenant_id": TENANT_ID})
-            if resp.get("ok"):
-                st.success("Actualización de inbound enviada. Espera ~30 segundos antes de ejecutar la predicción.")
-                start_cooldown(COOLDOWN_S3)
-            else:
-                st.error(
-                    f"No se pudo actualizar inbound (S3). "
-                    f"Código: {resp.get('status')}, detalle: {resp.get('error') or resp.get('text')}"
-                )
+        st.button("🧾 Actualizar inbound (S3)", use_container_width=True, disabled=True, help="Modo BATCH: Las actualizaciones se ejecutan automáticamente")
+        # CÓDIGO COMENTADO - MODO BATCH
+        # if st.button("🧾 Actualizar inbound (S3)", use_container_width=True):
+        #     resp = trigger_make(MAKE_WEBHOOK_S3_URL, {"reason": "ui_run", "tenant_id": TENANT_ID})
+        #     if resp.get("ok"):
+        #         st.success("Actualización de inbound enviada. Espera ~30 segundos antes de ejecutar la predicción.")
+        #         start_cooldown(COOLDOWN_S3)
+        #     else:
+        #         st.error(
+        #             f"No se pudo actualizar inbound (S3). "
+        #             f"Código: {resp.get('status')}, detalle: {resp.get('error') or resp.get('text')}"
+        #         )
 
     st.markdown("")
+    
+    # HENRY: Mostrar última actualización de S1, S2 y S3
+    if CURRENT_SHEET_ID and CURRENT_SHEET_ID != DEFAULT_SHEET_ID:
+        last_update_s1 = _get_last_update_timestamp(CURRENT_SHEET_ID, "S1")
+        last_update_s2 = _get_last_update_timestamp(CURRENT_SHEET_ID, "S2")
+        last_update_s3 = _get_last_update_timestamp(CURRENT_SHEET_ID, "S3")
+        
+        if last_update_s1 or last_update_s2 or last_update_s3:
+            col_info1, col_info2, col_info3 = st.columns(3)
+            with col_info1:
+                if last_update_s1:
+                    # Calcular tiempo transcurrido
+                    ahora = pd.Timestamp.now()
+                    tiempo_transcurrido = ahora - last_update_s1
+                    horas = int(tiempo_transcurrido.total_seconds() / 3600)
+                    minutos = int((tiempo_transcurrido.total_seconds() % 3600) / 60)
+                    
+                    if horas > 0:
+                        tiempo_str = f"{horas}h {minutos}m"
+                    elif minutos > 0:
+                        tiempo_str = f"{minutos}m"
+                    else:
+                        tiempo_str = "hace unos momentos"
+                    
+                    st.caption(f"📘 **Última actualización de ventas (S1):** {last_update_s1.strftime('%Y-%m-%d %H:%M:%S')} ({tiempo_str} atrás)")
+                else:
+                    st.caption("📘 **Última actualización de ventas (S1):** No disponible")
+            
+            with col_info2:
+                if last_update_s2:
+                    # Calcular tiempo transcurrido
+                    ahora = pd.Timestamp.now()
+                    tiempo_transcurrido = ahora - last_update_s2
+                    horas = int(tiempo_transcurrido.total_seconds() / 3600)
+                    minutos = int((tiempo_transcurrido.total_seconds() % 3600) / 60)
+                    
+                    if horas > 0:
+                        tiempo_str = f"{horas}h {minutos}m"
+                    elif minutos > 0:
+                        tiempo_str = f"{minutos}m"
+                    else:
+                        tiempo_str = "hace unos momentos"
+                    
+                    st.caption(f"📦 **Última actualización de stock (S2):** {last_update_s2.strftime('%Y-%m-%d %H:%M:%S')} ({tiempo_str} atrás)")
+                else:
+                    st.caption("📦 **Última actualización de stock (S2):** No disponible")
+
+            with col_info3:
+                if last_update_s3:
+                    # Calcular tiempo transcurrido
+                    ahora = pd.Timestamp.now()
+                    tiempo_transcurrido = ahora - last_update_s3
+                    horas = int(tiempo_transcurrido.total_seconds() / 3600)
+                    minutos = int((tiempo_transcurrido.total_seconds() % 3600) / 60)
+                    
+                    if horas > 0:
+                        tiempo_str = f"{horas}h {minutos}m"
+                    elif minutos > 0:
+                        tiempo_str = f"{minutos}m"
+                    else:
+                        tiempo_str = "hace unos momentos"
+                    
+                    st.caption(f"🧾 **Última actualización inbound (S3):** {last_update_s3.strftime('%Y-%m-%d %H:%M:%S')} ({tiempo_str} atrás)")
+                else:
+                    st.caption("🧾 **Última actualización inbound (S3):** No disponible")
+            
+            st.markdown("---")
 
     # filtros
     colA, colB, colC = st.columns(3)
@@ -749,64 +1654,199 @@ if modulo_activo == "Compras":
 
     # opciones avanzadas
     with st.expander("Opciones avanzadas (Make / Debug)"):
-        disparar        = st.checkbox("Disparar S1/S2/S3 antes de predecir", value=False)
+        # MODO BATCH: Opción "Disparar S1/S2/S3" deshabilitada
+        # disparar = st.checkbox("Disparar S1/S2/S3 antes de predecir", value=False)
+        disparar = False  # Siempre False en modo BATCH
         mostrar_debug   = st.checkbox("Mostrar debug de columnas/valores config", value=False)
         mostrar_inbound = st.checkbox("Mostrar inbound agrupado", value=True)
         mostrar_stocks  = st.checkbox("Mostrar stocks (informativos)", value=True)
 
     # --------------------------------------
-    # BOTÓN PRINCIPAL (con cooldown)
+    # BOTÓN PRINCIPAL (MODO BATCH - verificación de estado)
     # --------------------------------------
-    now_ts = time.time()
-    cooldown_until = st.session_state.get("cooldown_until", 0)
-    remaining = max(0, int(cooldown_until - now_ts))
+    # MODO BATCH: Verificar si el batch está listo en lugar de usar cooldown
+    batch_check = check_batch_ready(CURRENT_SHEET_ID) if CURRENT_SHEET_ID else {"ready": False, "message": "Sheet ID no configurado", "status": "UNKNOWN"}
+    
+    # CÓDIGO COMENTADO - LÓGICA DE COOLDOWN ELIMINADA EN MODO BATCH
+    # now_ts = time.time()
+    # cooldown_until = st.session_state.get("cooldown_until", 0)
+    # remaining = max(0, int(cooldown_until - now_ts))
+    remaining = 0  # Siempre 0 en modo BATCH
+    
+    # Mostrar estado del batch
+    if not batch_check["ready"]:
+        st.info(batch_check["message"])
+        # Si necesita rerun para continuar verificando, hacerlo después de 3 segundos
+        if batch_check.get("needs_rerun", False):
+            time.sleep(3)
+            st.rerun()
+    
+    # CÓDIGO ELIMINADO - LÓGICA DE COOLDOWN NO USADA EN MODO BATCH
+    # Todo el bloque de cooldown fue eliminado y reemplazado por check_batch_ready()
+    
+    # MODO BATCH: Eliminar verificación de snapshots (ya no se crean desde la UI)
+    # Las verificaciones ahora se hacen solo con check_batch_ready()
+    
+    # CÓDIGO ELIMINADO: Todo el bloque de cooldown y verificación de snapshots fue eliminado
+    # En modo BATCH, solo usamos check_batch_ready() para verificar el estado
+    
+    # HENRY: Verificar si las actualizaciones batch están listas (ANTES del botón)
+    # MODO BATCH: Ya no verificamos snapshots, solo el estado batch
+    # CÓDIGO ELIMINADO: Todo el bloque de verificación de snapshots y cooldown fue eliminado
+    # En modo BATCH, solo usamos check_batch_ready() que ya se ejecutó arriba
+    
+    # Verificar estado batch (ya hecho arriba con check_batch_ready)
+    # batch_check ya contiene el estado y mensaje
+    
+    # CÓDIGO ELIMINADO: Todo el bloque de verificación de snapshots y cooldown fue eliminado
+    # El código siguiente estaba mal indentado y fue eliminado completamente
+    # (Más de 200 líneas de código de cooldown fueron eliminadas)
+    
+    # MODO BATCH: La verificación de batch ya se hizo arriba con check_batch_ready()
+    # No necesitamos verificar snapshots ni cooldowns
+    # TODO EL CÓDIGO DE COOLDOWN FUE ELIMINADO (más de 200 líneas)
+    # El bloque completo de verificación de snapshots y cooldown fue eliminado
+    # En modo BATCH, solo usamos check_batch_ready() que ya se ejecutó arriba
+    
+    # CÓDIGO ELIMINADO: Todo el bloque de cooldown (más de 200 líneas) fue eliminado
+    # El código siguiente estaba mal indentado y causaba errores de sintaxis
+    # Fue completamente eliminado en modo BATCH
+    
+    # MODO BATCH: Verificación de actualizaciones (simplificada - sin snapshots)
+    # Ya no verificamos snapshots porque las actualizaciones son automáticas por batch
+    # TODO EL CÓDIGO DE COOLDOWN (más de 200 líneas) FUE ELIMINADO
+    # Todo el bloque de código mal indentado fue eliminado (más de 200 líneas)
+    
+    # MODO BATCH: Verificación simplificada - solo verificamos batch_check que ya se hizo arriba
+    # TODO EL CÓDIGO DE COOLDOWN (más de 200 líneas) FUE ELIMINADO COMPLETAMENTE
 
-    # HENRY: placeholder para mostrar un contador en vivo
-    cooldown_placeholder = st.empty()
+    # MODO BATCH: Verificación simplificada - no verificamos snapshots
+    # Las actualizaciones son automáticas por batch, solo verificamos batch_check
+    verification_messages = []  # Vacío en modo BATCH (no hay snapshots)
+    # CÓDIGO COMENTADO - MODO BATCH
+    # if remaining == 0:
+    #     verification_messages = []
+    #     if "snapshot_S1" in st.session_state:
+    #         if not CURRENT_SHEET_ID or not CURRENT_SHEET_ID.strip():
+    #             if TENANT_ROW:
+    #                 st.error("❌ **ERROR DE SEGURIDAD**: Se intentó verificar actualización pero CURRENT_SHEET_ID no está configurado correctamente.")
+    #         check_s1 = check_update_success(CURRENT_SHEET_ID, "S1", COOLDOWN_S1)
+    #         if check_s1["warnings"] or check_s1["errors"]:
+    #             verification_messages.append({...})
+    #         elif check_s1["success"]:
+    #             verification_messages.append({...})
+    #     if "snapshot_S2" in st.session_state:
+    #         if not CURRENT_SHEET_ID or not CURRENT_SHEET_ID.strip():
+    #             if TENANT_ROW:
+    #                 st.error("...")
+    #         cooldown_s2_verificacion = calculate_dynamic_cooldown("S2", COOLDOWN_S2)
+    #         check_s2 = check_update_success(CURRENT_SHEET_ID, "S2", cooldown_s2_verificacion)
+    #         if check_s2["warnings"] or check_s2["errors"]:
+    #             verification_messages.append({...})
+    #         elif check_s2["success"]:
+    #             verification_messages.append({...})
+    #     if verification_messages:
+    #         st.markdown("---")
+    #         for msg in verification_messages:
+    #             st.subheader(msg["title"])
+    #             if msg.get("success_msg"):
+    #                 st.success(msg["success_msg"])
+    #             for warning in msg["warnings"]:
+    #                 st.warning(warning)
+    #             for error in msg["errors"]:
+    #                 st.error(error)
+    #             if msg["success"] and not msg.get("success_msg") and (msg["warnings"] or msg["errors"]):
+    #                 st.info("ℹ️ Los datos se leyeron correctamente, pero se detectaron posibles problemas con la actualización.")
+    #         st.markdown("---")
 
-    if remaining > 0:
-        # Contador regresivo en vivo (máx 90s según los COOLDOWN_* que definimos)
-        for sec in range(remaining, 0, -1):
-            cooldown_placeholder.warning(
-                "Se están actualizando datos desde KAME/Make. "
-                f"Espera aproximadamente {sec} segundos antes de ejecutar la predicción."
-            )
-            time.sleep(1)
-        # Al terminar el contador limpiamos estado y mensaje
-        cooldown_placeholder.empty()
-        st.session_state["cooldown_until"] = 0
-        remaining = 0
-
-    # Si ya no hay espera pendiente, el botón queda habilitado
-    if remaining > 0:
-        main_label = f"Ejecutar predicción (espera {remaining}s)"
+    # HENRY: Verificar si hay errores críticos que bloqueen la ejecución
+    critical_errors = []
+    critical_warnings = []
+    
+    # MODO BATCH: No verificamos snapshots (las actualizaciones son automáticas)
+    # CÓDIGO COMENTADO - MODO BATCH
+    # if remaining == 0:
+    #     # Re-ejecutar verificaciones si hay snapshots
+    #     if "snapshot_S1" in st.session_state or "snapshot_S2" in st.session_state:
+    #         if "snapshot_S1" in st.session_state:
+    #             check_s1 = check_update_success(CURRENT_SHEET_ID, "S1", COOLDOWN_S1)
+    #             if check_s1["errors"]:
+    #                 critical_errors.extend([f"S1: {e}" for e in check_s1["errors"]])
+    #             for w in check_s1["warnings"]:
+    #                 if "ACTUALIZACIÓN INCOMPLETA" in w or "incompleta" in w.lower():
+    #                     critical_warnings.append(f"S1: {w}")
+    #         if "snapshot_S2" in st.session_state:
+    #             cooldown_s2_verificacion = calculate_dynamic_cooldown("S2", COOLDOWN_S2)
+    #             check_s2 = check_update_success(CURRENT_SHEET_ID, "S2", cooldown_s2_verificacion)
+    #             if check_s2["errors"]:
+    #                 critical_errors.extend([f"S2: {e}" for e in check_s2["errors"]])
+    #             for w in check_s2["warnings"]:
+    #                 if "ACTUALIZACIÓN INCOMPLETA" in w or "incompleta" in w.lower():
+    #                     critical_warnings.append(f"S2: {w}")
+    
+    # Guardar estado de verificación para mostrar antes de ejecutar
+    st.session_state["critical_errors"] = critical_errors
+    st.session_state["critical_warnings"] = critical_warnings
+    
+    # MODO BATCH: El botón se habilita solo si el batch está listo
+    # Verificar estado batch (ya hecho arriba con check_batch_ready)
+    if not batch_check["ready"]:
+        main_label = f"Ejecutar predicción (BLOQUEADO: {batch_check['message']})"
         main_disabled = True
+    elif critical_errors:
+        main_label = "❌ Ejecutar predicción (BLOQUEADO: errores críticos)"
+        main_disabled = True
+    elif critical_warnings:
+        main_label = "⚠️ Ejecutar predicción (advertencias críticas)"
+        main_disabled = False
     else:
         main_label = "Ejecutar predicción"
         main_disabled = False
 
+    # Mostrar advertencias críticas antes del botón
+    if critical_errors:
+        st.error("🚫 **EJECUCIÓN BLOQUEADA**: Se detectaron errores críticos en las actualizaciones. No se puede ejecutar la predicción con datos incompletos o erróneos.")
+        for err in critical_errors:
+            st.error(f"  • {err}")
+        st.info("💡 **Recomendación**: Reintenta la actualización (S1/S2) y espera a que se complete correctamente antes de ejecutar la predicción.")
+    
+    if critical_warnings and not critical_errors:
+        st.warning("⚠️ **ADVERTENCIA CRÍTICA**: Se detectaron posibles actualizaciones incompletas. Se recomienda reintentar antes de ejecutar la predicción.")
+        for warn in critical_warnings:
+            st.warning(f"  • {warn}")
+        st.info("💡 **Recomendación**: Espera a que el batch complete la actualización. Las actualizaciones se ejecutan automáticamente.")
+
     if st.button(main_label, type="primary", use_container_width=True, disabled=main_disabled):
-        # HENRY: modo "disparar S1/S2/S3 antes de predecir"
-        if disparar and not st.session_state.get("batch_scenarios_disparados", False):
-            st.info("Disparando S1 (ventas), S2 (stock total) y S3 (inbound) desde la app…")
-
-            s1 = trigger_make(MAKE_WEBHOOK_S1_URL, {"reason": "ui_run", "tenant_id": TENANT_ID})
-            s2 = trigger_make(
-                MAKE_WEBHOOK_S2_URL,
-                {"reason": "ui_run", "tenant_id": TENANT_ID, "use_stock_total": True},
-            )
-            s3 = trigger_make(MAKE_WEBHOOK_S3_URL, {"reason": "ui_run", "tenant_id": TENANT_ID})
-
-            if s1.get("ok") and s2.get("ok") and s3.get("ok"):
-                # un solo cooldown largo para los tres (usa los mismos tiempos definidos arriba)
-                start_cooldown(max(COOLDOWN_S1, COOLDOWN_S2, COOLDOWN_S3))
-                st.session_state["batch_scenarios_disparados"] = True
-            else:
-                st.error(
-                    "Alguno de los escenarios S1/S2/S3 devolvió error. "
-                    "Revisa el escenario en Make antes de ejecutar la predicción."
-                )
-            st.rerun()  # volvemos a correr el script para que aparezca el contador
+        # MODO BATCH: Verificación rápida final (sin revalidar completamente)
+        # Si el batch ya estaba confirmado, verificar rápidamente que sigue listo
+        if not batch_check["ready"]:
+            st.error(f"❌ **EJECUCIÓN CANCELADA**: {batch_check['message']}")
+            st.stop()
+        
+        # BLOQUEO FINAL: No ejecutar si hay errores críticos
+        if critical_errors:
+            st.error("❌ **EJECUCIÓN CANCELADA**: No se puede ejecutar la predicción con errores críticos en los datos.")
+            st.stop()
+        # MODO BATCH: Opción "disparar S1/S2/S3" deshabilitada
+        # CÓDIGO COMENTADO - MODO BATCH
+        # if disparar and not st.session_state.get("batch_scenarios_disparados", False):
+        # CÓDIGO COMENTADO - MODO BATCH
+        # if disparar and not st.session_state.get("batch_scenarios_disparados", False):
+        #     st.info("Disparando S1 (ventas), S2 (stock total) y S3 (inbound) desde la app…")
+        #     if CURRENT_SHEET_ID and CURRENT_SHEET_ID != DEFAULT_SHEET_ID:
+        #         save_data_snapshot(CURRENT_SHEET_ID, "S1")
+        #         save_data_snapshot(CURRENT_SHEET_ID, "S2")
+        #     s1 = trigger_make(MAKE_WEBHOOK_S1_URL, {"reason": "ui_run", "tenant_id": TENANT_ID})
+        #     s2 = trigger_make(MAKE_WEBHOOK_S2_URL, {"reason": "ui_run", "tenant_id": TENANT_ID, "use_stock_total": True})
+        #     s3 = trigger_make(MAKE_WEBHOOK_S3_URL, {"reason": "ui_run", "tenant_id": TENANT_ID})
+        #     if s1.get("ok") and s2.get("ok") and s3.get("ok"):
+        #         cooldown_s1_dynamic = calculate_dynamic_cooldown("S1", COOLDOWN_S1)
+        #         cooldown_s2_dynamic = calculate_dynamic_cooldown("S2", COOLDOWN_S2)
+        #         start_cooldown(max(cooldown_s1_dynamic, cooldown_s2_dynamic, COOLDOWN_S3))
+        #         st.session_state["batch_scenarios_disparados"] = True
+        #     else:
+        #         st.error("Alguno de los escenarios S1/S2/S3 devolvió error.")
+        #     st.rerun()
 
         # Si llegamos aquí:
         # - disparar == False  → predicción normal
@@ -949,41 +1989,66 @@ elif modulo_activo == "Ventas":
         st.stop()
 
     # --------------------------------------
-    # BOTÓN ACTUALIZAR VENTAS (S1)
+    # BOTÓN ACTUALIZAR VENTAS (S1) - DESHABILITADO - MODO BATCH
     # --------------------------------------
-    if st.button("📘 Actualizar ventas (S1)", use_container_width=True):
-        resp = trigger_make(MAKE_WEBHOOK_S1_URL, {"reason": "ui_run", "tenant_id": TENANT_ID})
-        if resp.get("ok"):
-            st.success("Actualización de ventas enviada a Make. Espera ~60 segundos antes de ejecutar la predicción.")
-            start_cooldown(COOLDOWN_S1)
-            st.rerun()  # Recargar para mostrar el contador regresivo
+    st.button("📘 Actualizar ventas (S1)", use_container_width=True, disabled=True, help="Modo BATCH: Las actualizaciones se ejecutan automáticamente")
+    # CÓDIGO COMENTADO - MODO BATCH
+    # if st.button("📘 Actualizar ventas (S1)", use_container_width=True):
+    #     if not CURRENT_SHEET_ID or not CURRENT_SHEET_ID.strip():
+    #         st.error("❌ **ERROR DE SEGURIDAD**: No se puede actualizar ventas. CURRENT_SHEET_ID no está configurado correctamente.")
+    #     else:
+    #         save_data_snapshot(CURRENT_SHEET_ID, "S1")
+    #         resp = trigger_make(MAKE_WEBHOOK_S1_URL, {"reason": "ui_run", "tenant_id": TENANT_ID})
+    #     if resp.get("ok"):
+    #         st.success(f"Actualización de ventas enviada a Make. Espera ~{COOLDOWN_S1} segundos antes de ejecutar la predicción.")
+    #         start_cooldown(COOLDOWN_S1)
+    #         st.rerun()
+    #     else:
+    #         st.error(
+    #             f"No se pudo actualizar ventas (S1). "
+    #             f"Código: {resp.get('status')}, detalle: {resp.get('error') or resp.get('text')}"
+    #         )
+    
+    # HENRY: Mostrar última actualización de S1 (módulo Ventas)
+    if CURRENT_SHEET_ID and CURRENT_SHEET_ID != DEFAULT_SHEET_ID:
+        last_update_s1 = _get_last_update_timestamp(CURRENT_SHEET_ID, "S1")
+        if last_update_s1:
+            # Calcular tiempo transcurrido
+            ahora = pd.Timestamp.now()
+            tiempo_transcurrido = ahora - last_update_s1
+            horas = int(tiempo_transcurrido.total_seconds() / 3600)
+            minutos = int((tiempo_transcurrido.total_seconds() % 3600) / 60)
+            
+            if horas > 0:
+                tiempo_str = f"{horas}h {minutos}m"
+            elif minutos > 0:
+                tiempo_str = f"{minutos}m"
+            else:
+                tiempo_str = "hace unos momentos"
+            
+            st.caption(f"📘 **Última actualización de ventas (S1):** {last_update_s1.strftime('%Y-%m-%d %H:%M:%S')} ({tiempo_str} atrás)")
         else:
-            st.error(
-                f"No se pudo actualizar ventas (S1). "
-                f"Código: {resp.get('status')}, detalle: {resp.get('error') or resp.get('text')}"
-            )
+            st.caption("📘 **Última actualización de ventas (S1):** No disponible")
+        st.markdown("---")
 
-    # Contador regresivo (igual que en Compras)
-    now_ts = time.time()
-    cooldown_until = st.session_state.get("cooldown_until", 0)
-    remaining = max(0, int(cooldown_until - now_ts))
-
-    # Placeholder para mostrar un contador en vivo
-    cooldown_placeholder = st.empty()
-
-    if remaining > 0:
-        # Contador regresivo en vivo (máx 60s para S1)
-        for sec in range(remaining, 0, -1):
-            cooldown_placeholder.warning(
-                "Se están actualizando datos desde KAME/Make. "
-                f"Espera aproximadamente {sec} segundos antes de ejecutar la predicción."
-            )
-            time.sleep(1)
-        # Al terminar el contador limpiamos estado y mensaje
-        cooldown_placeholder.empty()
-        st.session_state["cooldown_until"] = 0
-        remaining = 0
-        st.rerun()  # Recargar para quitar el mensaje
+    # MODO BATCH: Verificación de batch (igual que en Compras)
+    batch_check_ventas = check_batch_ready(CURRENT_SHEET_ID) if CURRENT_SHEET_ID else {"ready": False, "message": "Sheet ID no configurado", "status": "UNKNOWN"}
+    remaining = 0  # Siempre 0 en modo BATCH
+    
+    # Mostrar estado del batch
+    if not batch_check_ventas["ready"]:
+        st.info(batch_check_ventas["message"])
+    
+    # CÓDIGO ELIMINADO - LÓGICA DE COOLDOWN ELIMINADA EN MODO BATCH
+    # if remaining > 0:
+    #     # Contador regresivo en vivo (máx 60s para S1)
+    #     for sec in range(remaining, 0, -1):
+    #         cooldown_placeholder.warning(...)
+    #         time.sleep(1)
+    #     cooldown_placeholder.empty()
+    #     st.session_state["cooldown_until"] = 0
+    #     remaining = 0
+    #     st.rerun()
 
     st.markdown("")
 
@@ -1118,7 +2183,37 @@ elif modulo_activo == "Ventas":
     usar_estacionalidad = st.session_state.get("usar_estacionalidad", False)
     # === FIN estacionalidad manual ===
 
-    if st.button("Calcular proyección de ventas", type="primary", use_container_width=True):
+    # MODO BATCH: Verificación simplificada (módulo Ventas)
+    # El botón se habilita solo si el batch está listo
+    critical_errors_ventas = []
+    critical_warnings_ventas = []
+    
+    # MODO BATCH: No verificamos snapshots (las actualizaciones son automáticas)
+    # CÓDIGO COMENTADO - MODO BATCH
+    # if "snapshot_S1" in st.session_state:
+    #     check_s1 = check_update_success(CURRENT_SHEET_ID, "S1", COOLDOWN_S1)
+    #     ...
+    
+    # Determinar si el botón debe estar deshabilitado (basado en batch_check)
+    button_disabled = not batch_check_ventas["ready"]
+    button_label = "Calcular proyección de ventas"
+    if not batch_check_ventas["ready"]:
+        button_label = f"❌ Calcular proyección (BLOQUEADO: {batch_check_ventas['message']})"
+    elif critical_errors_ventas:
+        button_label = "❌ Calcular proyección (BLOQUEADO: errores críticos)"
+    elif critical_warnings_ventas:
+        button_label = "⚠️ Calcular proyección (advertencias críticas)"
+    
+    if st.button(button_label, type="primary", use_container_width=True, disabled=button_disabled):
+        # MODO BATCH: Verificar que el batch esté listo
+        if not batch_check_ventas["ready"]:
+            st.error(f"❌ **EJECUCIÓN CANCELADA**: {batch_check_ventas['message']}")
+            st.stop()
+        # BLOQUEO FINAL: No ejecutar si hay errores críticos
+        if critical_errors_ventas:
+            st.error("❌ **EJECUCIÓN CANCELADA**: No se puede ejecutar la predicción con errores críticos en los datos.")
+            st.stop()
+        
         # Definir variables al inicio del bloque del botón
         freq_code = "M" if freq_label.startswith("Mensual") else "W"
         estacionalidad_aplicada = False
@@ -1135,6 +2230,23 @@ elif modulo_activo == "Ventas":
             if ventas_ext is None or ventas_ext.empty:
                 st.warning("No hay ventas para los filtros dados.")
                 st.stop()
+            
+            # HENRY: Verificar si la actualización reciente de ventas fue exitosa
+            if "snapshot_S1" in st.session_state:
+                check_s1 = check_update_success(CURRENT_SHEET_ID, "S1", COOLDOWN_S1)
+                st.markdown("---")
+                if check_s1["warnings"] or check_s1["errors"]:
+                    st.subheader("🔍 Verificación de actualización de ventas (S1)")
+                    for warning in check_s1["warnings"]:
+                        st.warning(warning)
+                    for error in check_s1["errors"]:
+                        st.error(error)
+                    if check_s1["success"]:
+                        st.info("ℹ️ Los datos se leyeron correctamente, pero se detectaron posibles problemas con la actualización.")
+                elif check_s1["success"]:
+                    st.subheader("✅ Verificación de actualización de ventas (S1)")
+                    st.success("Los datos de ventas se actualizaron correctamente.")
+                st.markdown("---")
 
             # Mejora #1: Advertencia cuando se selecciona frecuencia semanal
             if usar_estacionalidad and seasonal_weights is not None:
