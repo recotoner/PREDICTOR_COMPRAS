@@ -293,8 +293,9 @@ def read_gsheets(sheet_id: str, tab: str) -> pd.DataFrame:
     
     # IMPORTANTE: Google Sheets a veces no exporta correctamente valores con corchetes [2A] cuando están en formato "Automático"
     # Solución: Leer el CSV directamente con requests para ver qué está devolviendo realmente
+    # Agregamos un parámetro de tiempo para evitar cache del servidor/proxy
     url = (f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?"
-           f"tqx=out:csv&sheet={sheet_param}")
+           f"tqx=out:csv&sheet={sheet_param}&t={int(time.time())}")
     
     try:
         # Intentar leer directamente con requests para debug
@@ -700,20 +701,44 @@ def _get_last_update_timestamp(sheet_id: str, update_type: str) -> Optional[pd.T
             
         # Determinar columna según el tipo (0-indexed, Row 2 del sheet = Row 0 del DF)
         col_idx = -1
+        search_name = ""
         if update_type == "S1":
             col_idx = 7  # Columna H
+            search_name = "last_update_s1"
         elif update_type == "S2":
             col_idx = 8  # Columna I
+            search_name = "last_update_s2"
         elif update_type == "S3":
             col_idx = 10 # Columna K
+            search_name = "last_update_s3"
             
+        ts_found = None
+        
+        # 1. Intentar por índice fijo (REQUISITO EXPLÍCITO)
+        # HENRY: Buscamos en toda la columna (no solo fila 1) para encontrar el más reciente
         if col_idx != -1 and len(config_df.columns) > col_idx:
-            if len(config_df) > 0:
-                ts_str = str(config_df.iloc[0, col_idx]).strip()
-                # Fallback "No disponible" implícito si to_datetime falla o es NaT
-                ts = pd.to_datetime(ts_str, errors="coerce")
-                if pd.notna(ts):
-                    return ts
+            series = pd.to_datetime(config_df.iloc[:, col_idx], errors="coerce")
+            ts_found = series.max()
+        
+        # 2. Fallback por nombre si el índice no funcionó o no encontró nada
+        if ts_found is None and search_name:
+            cols_lc = {str(c).lower().strip(): c for c in config_df.columns}
+            if search_name in cols_lc:
+                series = pd.to_datetime(config_df[cols_lc[search_name]], errors="coerce")
+                ts_found = series.max()
+        
+        # 3. Otros fallbacks genéricos
+        if ts_found is None:
+            for col_name in ["ultima_actualizacion", "timestamp"]:
+                cols_lc = {str(c).lower().strip(): c for c in config_df.columns}
+                if col_name in cols_lc:
+                    series = pd.to_datetime(config_df[cols_lc[col_name]], errors="coerce")
+                    ts_found = series.max()
+                    if ts_found is not None:
+                        break
+
+        if ts_found is not None and pd.notna(ts_found):
+            return ts_found
                     
     except Exception:
         pass
@@ -774,6 +799,68 @@ def _get_update_status(sheet_id: str, update_type: str) -> Optional[str]:
     
     return None
 
+def _get_elapsed_time_info(ts: Optional[pd.Timestamp]) -> str:
+    """
+    Calcula el tiempo transcurrido desde un timestamp hasta ahora,
+    usando explícitamente la zona horaria de Chile.
+    """
+    if ts is None or pd.isna(ts):
+        return "No disponible"
+    
+    try:
+        # Zona horaria de Chile
+        tz_chile = "America/Santiago"
+        
+        # 1. Asegurar que el timestamp sea un objeto Timestamp de pandas
+        ts = pd.Timestamp(ts)
+        
+        # 2. Obtener hora actual en Chile (consciente de zona horaria)
+        # Usamos un método más directo para evitar problemas de versiones
+        ahora_chile = pd.Timestamp.now(tz=tz_chile)
+        
+        # 3. Normalizar el timestamp del sheet a la zona horaria de Chile
+        if ts.tzinfo is None:
+            # Si no tiene zona horaria, asumimos que es hora de Chile
+            ts_aware = ts.tz_localize(tz_chile, ambiguous='infer')
+        else:
+            # Si ya tiene, la convertimos a Chile
+            ts_aware = ts.tz_convert(tz_chile)
+            
+        # 4. Calcular diferencia
+        diff = ahora_chile - ts_aware
+        total_seconds = diff.total_seconds()
+        
+        if total_seconds < -60:
+            # Si el timestamp es futuro (más de 1 min), algo está raro con los relojes
+            return "recién actualizado"
+        elif total_seconds < 0:
+            # Pequeñas diferencias negativas son normales por sincronización
+            return "hace unos momentos"
+            
+        horas = int(total_seconds // 3600)
+        minutos = int((total_seconds % 3600) // 60)
+        
+        if horas > 0:
+            return f"{horas}h {minutos}m"
+        elif minutos > 0:
+            return f"{minutos}m"
+        else:
+            return "hace unos momentos"
+    except Exception as e:
+        # En lugar de solo decir "No disponible", intentamos una resta naive como último recurso
+        try:
+            ahora_naive = pd.Timestamp.now()
+            ts_naive = ts.replace(tzinfo=None) if hasattr(ts, 'replace') else ts
+            diff = ahora_naive - ts_naive
+            total_seconds = diff.total_seconds()
+            horas = int(total_seconds // 3600)
+            minutos = int((total_seconds % 3600) // 60)
+            if horas > 0: return f"{horas}h {minutos}m"
+            if minutos > 0: return f"{minutos}m"
+            return "hace unos momentos"
+        except:
+            return "No disponible"
+
 # MODO BATCH: Función para verificar si el batch está listo (STATUS_FINAL == "DONE" y timestamp estable)
 def check_batch_ready(sheet_id: str) -> dict:
     """
@@ -800,41 +887,26 @@ def check_batch_ready(sheet_id: str) -> dict:
         current_timestamp = _get_last_update_timestamp(sheet_id, "S2")
         confirmed_timestamp = st.session_state.get("batch_ready_timestamp")
         
-        # Si el timestamp sigue siendo el mismo, el batch sigue listo
-        if current_timestamp is not None and confirmed_timestamp is not None:
-            if current_timestamp == confirmed_timestamp:
-                batch_status = _get_update_status(sheet_id, "S2")
-                if batch_status == "DONE":
-                    return {
-                        "ready": True,
-                        "message": "✅ Batch completado y verificado. Puedes ejecutar la predicción.",
-                        "status": "DONE"
-                    }
+        # Si el timestamp es None (batch reiniciado) o cambió, resetear confirmación
+        if current_timestamp is None or current_timestamp != confirmed_timestamp:
+            st.session_state["batch_ready_confirmed"] = False
+            st.session_state["batch_ready_timestamp"] = None
+            st.session_state["batch_timestamp_readings"] = []
+        else:
+            # El timestamp sigue siendo el mismo, verificar que el status siga siendo DONE
+            batch_status = _get_update_status(sheet_id, "S2")
+            if batch_status == "DONE":
+                return {
+                    "ready": True,
+                    "message": "✅ Batch completado y verificado. Puedes ejecutar la predicción.",
+                    "status": "DONE"
+                }
             else:
-                # El timestamp cambió, reiniciar verificación
+                # El status cambió (ej: a RUNNING), resetear
                 st.session_state["batch_ready_confirmed"] = False
+                st.session_state["batch_ready_timestamp"] = None
                 st.session_state["batch_timestamp_readings"] = []
-    
-    # Si ya confirmamos que el batch está listo, verificar rápidamente que sigue listo
-    if st.session_state.get("batch_ready_confirmed", False):
-        current_timestamp = _get_last_update_timestamp(sheet_id, "S2")
-        confirmed_timestamp = st.session_state.get("batch_ready_timestamp")
-        
-        # Si el timestamp sigue siendo el mismo, el batch sigue listo
-        if current_timestamp is not None and confirmed_timestamp is not None:
-            if current_timestamp == confirmed_timestamp:
-                batch_status = _get_update_status(sheet_id, "S2")
-                if batch_status == "DONE":
-                    return {
-                        "ready": True,
-                        "message": "✅ Batch completado y verificado. Puedes ejecutar la predicción.",
-                        "status": "DONE"
-                    }
-            else:
-                # El timestamp cambió, reiniciar verificación
-                st.session_state["batch_ready_confirmed"] = False
-                st.session_state["batch_timestamp_readings"] = []
-    
+
     # Verificar STATUS_FINAL
     batch_status = _get_update_status(sheet_id, "S2")  # Usamos S2 para verificar el batch completo
     
@@ -1579,71 +1651,35 @@ if modulo_activo == "Compras":
     st.markdown("")
     
     # HENRY: Mostrar última actualización de S1, S2 y S3
-    if CURRENT_SHEET_ID and CURRENT_SHEET_ID != DEFAULT_SHEET_ID:
+    if CURRENT_SHEET_ID and CURRENT_SHEET_ID.strip():
         last_update_s1 = _get_last_update_timestamp(CURRENT_SHEET_ID, "S1")
         last_update_s2 = _get_last_update_timestamp(CURRENT_SHEET_ID, "S2")
         last_update_s3 = _get_last_update_timestamp(CURRENT_SHEET_ID, "S3")
         
-        if last_update_s1 or last_update_s2 or last_update_s3:
-            col_info1, col_info2, col_info3 = st.columns(3)
-            with col_info1:
-                if last_update_s1:
-                    # Calcular tiempo transcurrido
-                    ahora = pd.Timestamp.now()
-                    tiempo_transcurrido = ahora - last_update_s1
-                    horas = int(tiempo_transcurrido.total_seconds() / 3600)
-                    minutos = int((tiempo_transcurrido.total_seconds() % 3600) / 60)
-                    
-                    if horas > 0:
-                        tiempo_str = f"{horas}h {minutos}m"
-                    elif minutos > 0:
-                        tiempo_str = f"{minutos}m"
-                    else:
-                        tiempo_str = "hace unos momentos"
-                    
-                    st.caption(f"📘 **Última actualización de ventas (S1):** {last_update_s1.strftime('%Y-%m-%d %H:%M:%S')} ({tiempo_str} atrás)")
-                else:
-                    st.caption("📘 **Última actualización de ventas (S1):** No disponible")
-            
-            with col_info2:
-                if last_update_s2:
-                    # Calcular tiempo transcurrido
-                    ahora = pd.Timestamp.now()
-                    tiempo_transcurrido = ahora - last_update_s2
-                    horas = int(tiempo_transcurrido.total_seconds() / 3600)
-                    minutos = int((tiempo_transcurrido.total_seconds() % 3600) / 60)
-                    
-                    if horas > 0:
-                        tiempo_str = f"{horas}h {minutos}m"
-                    elif minutos > 0:
-                        tiempo_str = f"{minutos}m"
-                    else:
-                        tiempo_str = "hace unos momentos"
-                    
-                    st.caption(f"📦 **Última actualización de stock (S2):** {last_update_s2.strftime('%Y-%m-%d %H:%M:%S')} ({tiempo_str} atrás)")
-                else:
-                    st.caption("📦 **Última actualización de stock (S2):** No disponible")
+        # Siempre mostrar la fila de información si tenemos un sheet ID
+        col_info1, col_info2, col_info3 = st.columns(3)
+        with col_info1:
+            if last_update_s1:
+                tiempo_str = _get_elapsed_time_info(last_update_s1)
+                st.caption(f"📘 **Última actualización de ventas (S1):** {last_update_s1.strftime('%Y-%m-%d %H:%M:%S')} ({tiempo_str} atrás)")
+            else:
+                st.caption("📘 **Última actualización de ventas (S1):** No disponible")
+        
+        with col_info2:
+            if last_update_s2:
+                tiempo_str = _get_elapsed_time_info(last_update_s2)
+                st.caption(f"📦 **Última actualización de stock (S2):** {last_update_s2.strftime('%Y-%m-%d %H:%M:%S')} ({tiempo_str} atrás)")
+            else:
+                st.caption("📦 **Última actualización de stock (S2):** No disponible")
 
-            with col_info3:
-                if last_update_s3:
-                    # Calcular tiempo transcurrido
-                    ahora = pd.Timestamp.now()
-                    tiempo_transcurrido = ahora - last_update_s3
-                    horas = int(tiempo_transcurrido.total_seconds() / 3600)
-                    minutos = int((tiempo_transcurrido.total_seconds() % 3600) / 60)
-                    
-                    if horas > 0:
-                        tiempo_str = f"{horas}h {minutos}m"
-                    elif minutos > 0:
-                        tiempo_str = f"{minutos}m"
-                    else:
-                        tiempo_str = "hace unos momentos"
-                    
-                    st.caption(f"🧾 **Última actualización inbound (S3):** {last_update_s3.strftime('%Y-%m-%d %H:%M:%S')} ({tiempo_str} atrás)")
-                else:
-                    st.caption("🧾 **Última actualización inbound (S3):** No disponible")
-            
-            st.markdown("---")
+        with col_info3:
+            if last_update_s3:
+                tiempo_str = _get_elapsed_time_info(last_update_s3)
+                st.caption(f"🧾 **Última actualización inbound (S3):** {last_update_s3.strftime('%Y-%m-%d %H:%M:%S')} ({tiempo_str} atrás)")
+            else:
+                st.caption("🧾 **Última actualización inbound (S3):** No disponible")
+        
+        st.markdown("---")
 
     # filtros
     colA, colB, colC = st.columns(3)
@@ -1660,6 +1696,27 @@ if modulo_activo == "Compras":
         mostrar_debug   = st.checkbox("Mostrar debug de columnas/valores config", value=False)
         mostrar_inbound = st.checkbox("Mostrar inbound agrupado", value=True)
         mostrar_stocks  = st.checkbox("Mostrar stocks (informativos)", value=True)
+        
+        if mostrar_debug:
+            st.write(f"**Debug BATCH Mode:**")
+            st.write(f"- TENANT_ID: `{TENANT_ID}`")
+            st.write(f"- CURRENT_SHEET_ID: `{CURRENT_SHEET_ID}`")
+            st.write(f"- Chile Now: `{pd.Timestamp.now(tz='America/Santiago')}`")
+            try:
+                test_cfg = read_gsheets(CURRENT_SHEET_ID, TAB_CONFIG)
+                st.write(f"- Lectura `{TAB_CONFIG}`: {'✅ OK' if not test_cfg.empty else '❌ Vacía/Error'}")
+                if not test_cfg.empty:
+                    st.write("- Columnas encontradas (índice: nombre):")
+                    st.write({i: col for i, col in enumerate(test_cfg.columns)})
+                    st.write("- Primera fila (valores crudos):", test_cfg.iloc[0].to_dict())
+                    
+                    # Probar cálculos de tiempo en debug
+                    for ut in ["S1", "S2", "S3"]:
+                        ts_test = _get_last_update_timestamp(CURRENT_SHEET_ID, ut)
+                        info_test = _get_elapsed_time_info(ts_test)
+                        st.write(f"- Test {ut}: TS=`{ts_test}`, Info=`{info_test}`")
+            except Exception as e:
+                st.error(f"Error en debug de config: {e}")
 
     # --------------------------------------
     # BOTÓN PRINCIPAL (MODO BATCH - verificación de estado)
@@ -2010,22 +2067,11 @@ elif modulo_activo == "Ventas":
     #         )
     
     # HENRY: Mostrar última actualización de S1 (módulo Ventas)
-    if CURRENT_SHEET_ID and CURRENT_SHEET_ID != DEFAULT_SHEET_ID:
+    if CURRENT_SHEET_ID and CURRENT_SHEET_ID.strip():
         last_update_s1 = _get_last_update_timestamp(CURRENT_SHEET_ID, "S1")
+        # Siempre mostrar la información si hay un sheet ID
         if last_update_s1:
-            # Calcular tiempo transcurrido
-            ahora = pd.Timestamp.now()
-            tiempo_transcurrido = ahora - last_update_s1
-            horas = int(tiempo_transcurrido.total_seconds() / 3600)
-            minutos = int((tiempo_transcurrido.total_seconds() % 3600) / 60)
-            
-            if horas > 0:
-                tiempo_str = f"{horas}h {minutos}m"
-            elif minutos > 0:
-                tiempo_str = f"{minutos}m"
-            else:
-                tiempo_str = "hace unos momentos"
-            
+            tiempo_str = _get_elapsed_time_info(last_update_s1)
             st.caption(f"📘 **Última actualización de ventas (S1):** {last_update_s1.strftime('%Y-%m-%d %H:%M:%S')} ({tiempo_str} atrás)")
         else:
             st.caption("📘 **Última actualización de ventas (S1):** No disponible")
