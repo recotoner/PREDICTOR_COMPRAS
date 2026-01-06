@@ -1945,12 +1945,23 @@ if modulo_activo == "Compras":
         # filtrar por SKU
         if modo == "Por SKU" and sku_q:
             f = str(sku_q).strip().lower()
+            ventas_antes = len(ventas)
             ventas      = ventas[ventas["sku"].str.lower() == f]
             stock_p     = stock_p[stock_p["sku"].str.lower() == f]
             stock_t     = stock_t[stock_t["sku"].str.lower() == f]
             stock_total = stock_total[stock_total["sku"].str.lower() == f]
             config      = config[config["sku"].str.lower() == f]
             inbound     = inbound[inbound["sku"].str.lower() == f]
+            
+            # DEBUG: Log de filtrado
+            if mostrar_debug:
+                st.write(f"🔍 DEBUG FILTRADO: SKU buscado='{f}' (original='{sku_q}')")
+                st.write(f"   Ventas antes del filtro: {ventas_antes} filas")
+                st.write(f"   Ventas después del filtro: {len(ventas)} filas")
+                if len(ventas) > 0:
+                    st.write(f"   SKUs únicos en ventas filtradas: {ventas['sku'].unique().tolist()}")
+                    st.write(f"   Rango de fechas: {ventas['fecha'].min()} a {ventas['fecha'].max()}")
+                    st.write(f"   Total cantidad: {ventas['qty'].sum()}")
 
         inbound_core = prepare_inbound_for_core(inbound)
 
@@ -1996,9 +2007,21 @@ if modulo_activo == "Compras":
         # si no hay ventas
         if ventas.empty:
             st.warning("No hay ventas para los filtros dados.")
+            if mostrar_debug:
+                st.write(f"🔍 DEBUG: ventas.empty=True. SKU buscado: '{sku_q if modo == 'Por SKU' and sku_q else 'N/A'}'")
         else:
             with st.spinner("Calculando pronóstico…"):
                 freq_code = "M" if freq.startswith("Mensual") else "W"
+                
+                # DEBUG: Log antes de forecast_all
+                if mostrar_debug:
+                    st.write(f"🔍 DEBUG PRE-FORECAST:")
+                    st.write(f"   Ventas a enviar: {len(ventas)} filas")
+                    st.write(f"   SKUs en ventas: {ventas['sku'].unique().tolist()}")
+                    st.write(f"   Stock a enviar: {len(stock_total)} filas")
+                    st.write(f"   SKUs en stock: {stock_total['sku'].unique().tolist() if not stock_total.empty else '[]'}")
+                    st.write(f"   Frecuencia: {freq_code}, Horizonte: {horizon}")
+                
                 det, res, prop = forecast_all(
                     ventas=ventas,
                     stock=stock_total,
@@ -2007,6 +2030,63 @@ if modulo_activo == "Compras":
                     freq=freq_code,
                     horizon_override=horizon,
                 )
+                
+                # DEBUG: Log después de forecast_all (siempre visible si hay problema)
+                if modo == "Por SKU" and sku_q and not det.empty:
+                    sku_target = str(sku_q).strip().upper()
+                    det_sku = det[det['sku'] == sku_target]
+                    if not det_sku.empty:
+                        # Verificar si hay períodos con demanda_predicha = 0
+                        ceros = det_sku[det_sku['demanda_predicha'] == 0]
+                        if len(ceros) > 0:
+                            with st.expander("⚠️ DEBUG: Períodos con demanda_predicha = 0", expanded=True):
+                                st.write(f"**SKU:** {sku_target}")
+                                st.write(f"**Períodos con demanda_predicha = 0:** {len(ceros)} de {len(det_sku)}")
+                                st.dataframe(ceros[['period', 'fecha_periodo', 'demanda_predicha']], use_container_width=True)
+                                st.write(f"**Períodos con demanda_predicha > 0:**")
+                                st.dataframe(det_sku[det_sku['demanda_predicha'] > 0][['period', 'fecha_periodo', 'demanda_predicha']], use_container_width=True)
+                                if not res.empty:
+                                    res_sku = res[res['sku'] == sku_target]
+                                    if not res_sku.empty:
+                                        st.write(f"**Modelo usado:** {res_sku.iloc[0]['modelo']}")
+                                        st.write(f"**Demanda_H total:** {res_sku.iloc[0]['demanda_H']}")
+                                        st.write(f"**Total_qty_hist:** {res_sku.iloc[0].get('total_qty_hist', 'N/A')}")
+                                        st.write(f"**nz (períodos con demanda>0 en histórico):** {res_sku.iloc[0].get('nz', 'N/A')}")
+                                        st.write(f"**zr (tasa de ceros en histórico):** {res_sku.iloc[0].get('zr', 'N/A')}")
+                
+                # DEBUG: Log completo (solo si mostrar_debug está activado)
+                if mostrar_debug:
+                    st.write(f"🔍 DEBUG POST-FORECAST:")
+                    st.write(f"   Detalle generado: {len(det)} filas")
+                    st.write(f"   Resumen generado: {len(res)} filas")
+                    st.write(f"   Propuesta generada: {len(prop)} filas")
+                    if not det.empty:
+                        st.write(f"   SKUs en detalle: {det['sku'].unique().tolist()}")
+                        if modo == "Por SKU" and sku_q:
+                            sku_target = str(sku_q).strip().upper()
+                            det_sku = det[det['sku'] == sku_target]
+                            if not det_sku.empty:
+                                st.write(f"   Detalle para {sku_target}: {len(det_sku)} períodos")
+                                if 'demanda_predicha' in det_sku.columns:
+                                    st.write(f"   Demanda predicha total: {det_sku['demanda_predicha'].sum()}")
+                                    st.write(f"   Valores por período:")
+                                    for _, row in det_sku.iterrows():
+                                        st.write(f"     {row['period']}: {row['demanda_predicha']}")
+                                else:
+                                    st.write(f"   Columnas disponibles: {list(det_sku.columns)}")
+                            else:
+                                st.write(f"   ⚠️ NO se encontró {sku_target} en detalle")
+                    if not res.empty:
+                        if modo == "Por SKU" and sku_q:
+                            sku_target = str(sku_q).strip().upper()
+                            res_sku = res[res['sku'] == sku_target]
+                            if not res_sku.empty:
+                                st.write(f"   Resumen para {sku_target}:")
+                                st.write(f"     Modelo: {res_sku.iloc[0]['modelo']}")
+                                st.write(f"     Demanda_H: {res_sku.iloc[0]['demanda_H']}")
+                                st.write(f"     Total_qty_hist: {res_sku.iloc[0].get('total_qty_hist', 'N/A')}")
+                            else:
+                                st.write(f"   ⚠️ NO se encontró {sku_target} en resumen")
 
             st.success("Listo ✅")
 
