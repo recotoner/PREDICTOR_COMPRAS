@@ -42,8 +42,31 @@ def _prep_series(ventas: pd.DataFrame, freq: str) -> pd.DataFrame:
     per = "M" if freq.upper().startswith("M") else "W"
     v["period"] = v["fecha"].dt.to_period(per).dt.to_timestamp()
 
-    # Agregar por periodo (sin períodos faltantes aún)
-    ts = v.groupby(["sku","period"], as_index=False)["qty"].sum()
+    # CORRECCIÓN CRÍTICA: Separar ventas positivas de notas de crédito
+    # Las notas de crédito por cambios de productos se vuelven a facturar,
+    # por lo que su efecto neto en unidades debería ser nulo.
+    # ESTRATEGIA: Usar solo ventas positivas (sin sumar negativas) para el modelo.
+    # Esto refleja la demanda real de unidades, no los ajustes contables.
+    
+    ventas_positivas = v[v["qty"] > 0].copy()
+    notas_credito = v[v["qty"] < 0].copy()
+    
+    # DEBUG: Información sobre la separación
+    if len(notas_credito) > 0:
+        total_ventas_pos = ventas_positivas["qty"].sum()
+        total_notas = abs(notas_credito["qty"].sum())
+        print(f"[DEBUG _prep_series] Separación ventas/notas de crédito:")
+        print(f"   Ventas positivas: {len(ventas_positivas)} registros, total: {total_ventas_pos:.2f}")
+        print(f"   Notas de crédito: {len(notas_credito)} registros, total: {total_notas:.2f}")
+        print(f"   Diferencia neta: {total_ventas_pos - total_notas:.2f}")
+    
+    # Agregar por periodo SOLO usando ventas positivas (demanda real)
+    # Esto evita que las notas de crédito distorsionen el modelo
+    ts = ventas_positivas.groupby(["sku","period"], as_index=False)["qty"].sum()
+    
+    # Si un período no tiene ventas positivas, no aparecerá en ts (será 0 implícitamente)
+    # Esto es correcto: si no hay ventas reales, la demanda es 0
+    
     return ts
 
 def _expand_full_periods(hist_df: pd.DataFrame, freq: str) -> pd.Series:
@@ -64,12 +87,69 @@ def _expand_full_periods(hist_df: pd.DataFrame, freq: str) -> pd.Series:
 # Modelos simples
 # ---------------------------
 def _simple_ma6(hist: pd.Series, horizon: int) -> np.ndarray:
+    """
+    Modelo simple basado en media móvil.
+    Usa la media de los últimos períodos como predicción constante.
+    """
     arr = hist.values.astype(float)
     if arr.size == 0:
         return np.zeros(horizon, dtype=float)
     k = min(6, arr.size)
     mean = arr[-k:].mean() if arr[-k:].sum() > 0 else 0.0
     return np.full(horizon, mean, dtype=float)
+
+def _robust_forecast(hist: pd.Series, horizon: int) -> np.ndarray:
+    """
+    Modelo robusto que detecta tendencias y proyecta de forma inteligente.
+    
+    Estrategia:
+    1. Si hay suficientes datos, detecta tendencia (creciente/decreciente)
+    2. Usa la media reciente (últimos períodos) como base
+    3. Si hay tendencia clara, la proyecta suavemente
+    4. Si no hay tendencia, usa la media reciente constante
+    """
+    arr = hist.values.astype(float)
+    if arr.size == 0:
+        return np.zeros(horizon, dtype=float)
+    
+    # Calcular medias de diferentes ventanas para detectar tendencia
+    total_periods = len(arr)
+    
+    # Media reciente (últimos 6 períodos o últimos 50% si hay menos de 6)
+    recent_window = min(6, max(3, total_periods // 2))
+    recent_mean = arr[-recent_window:].mean()
+    
+    # Media de períodos anteriores (para comparar tendencia)
+    if total_periods >= 12:
+        # Si hay suficientes datos, comparar primera mitad vs segunda mitad
+        mid_point = total_periods // 2
+        first_half_mean = arr[:mid_point].mean()
+        second_half_mean = arr[mid_point:].mean()
+        
+        # Detectar tendencia: si la diferencia es significativa (>20%), hay tendencia
+        if first_half_mean > 0:
+            trend_ratio = (second_half_mean - first_half_mean) / first_half_mean
+            has_trend = abs(trend_ratio) > 0.20  # 20% de cambio indica tendencia
+            
+            if has_trend:
+                # Hay tendencia: proyectar suavemente
+                # Usar la media reciente como base y aplicar una ligera proyección
+                trend_per_period = (second_half_mean - first_half_mean) / mid_point
+                
+                # Proyección suavizada (no tan agresiva como la tendencia pura)
+                smoothed_trend = trend_per_period * 0.5  # Reducir la tendencia al 50% para suavizar
+                
+                # Generar predicciones con ligera variación basada en tendencia
+                predictions = []
+                for i in range(horizon):
+                    pred = recent_mean + (smoothed_trend * (i + 1))
+                    predictions.append(max(0.0, pred))  # No permitir negativos
+                
+                return np.array(predictions, dtype=float)
+    
+    # No hay tendencia clara o pocos datos: usar media reciente constante
+    # Esto es más representativo que la media histórica completa
+    return np.full(horizon, recent_mean, dtype=float)
 
 
 # ---------------------------
@@ -135,23 +215,164 @@ def _croston_sba(arr: np.ndarray, horizon: int, alpha: float = 0.1) -> np.ndarra
 # ETS con guardas
 # ---------------------------
 def _ets_forecast(arr: np.ndarray, horizon: int, freq: str) -> (np.ndarray, str):
+    print(f"\n{'='*60}")
+    print(f"[DEBUG _ets_forecast] INICIO - Analizando estacionalidad")
+    print(f"{'='*60}")
+    print(f"   Longitud de serie histórica: {len(arr)}")
+    print(f"   Frecuencia: {freq}")
+    print(f"   Horizonte de predicción: {horizon}")
+    
     if not _HAS_SM or len(arr) < 3:
-        return _simple_ma6(pd.Series(arr), horizon), "Naive-MA6"
+        print(f"[DEBUG _ets_forecast] ⚠️ Usando modelo robusto (HAS_SM={_HAS_SM}, len(arr)={len(arr)})")
+        return _robust_forecast(pd.Series(arr), horizon), "Robust-Mean"
 
     s = _season_length(freq)
     trend = 'add' if len(arr) >= 3 else None
     seasonal = None
     sp = None
-    if s >= 2 and len(arr) >= 2*s:
+    
+    print(f"   Longitud de estación requerida: {s}")
+    
+    # CORRECCIÓN CRÍTICA: Requerir más períodos para estacionalidad confiable
+    # Con solo 2 años (24 períodos), la estacionalidad no es confiable y causa predicciones erróneas
+    # Requerimos al menos 3 años (36 períodos) para detectar estacionalidad de forma confiable
+    min_periods_estacionalidad = 3 * s if s >= 2 else float('inf')
+    min_teorico = 2 * s if s >= 2 else 'N/A'
+    
+    print(f"   Mínimo teórico para estacionalidad: {min_teorico}")
+    print(f"   Mínimo RECOMENDADO para estacionalidad confiable: {min_periods_estacionalidad if min_periods_estacionalidad != float('inf') else 'N/A'}")
+    
+    if s >= 2 and len(arr) >= min_periods_estacionalidad:
         seasonal, sp = 'add', s
+        print(f"[DEBUG _ets_forecast] ✅ ESTACIONALIDAD DETECTADA: seasonal='{seasonal}', seasonal_periods={sp}")
+        print(f"   La serie tiene {len(arr)} períodos, suficiente para estacionalidad confiable")
+    elif s >= 2 and len(arr) >= 2*s:
+        # Tiene el mínimo teórico pero no el recomendado - advertir pero permitir
+        print(f"[DEBUG _ets_forecast] ⚠️ Estacionalidad detectada con datos limitados")
+        print(f"   La serie tiene {len(arr)} períodos (mínimo teórico: {2*s}, recomendado: {min_periods_estacionalidad})")
+        print(f"   Se usará modelo SIN estacionalidad para mayor robustez")
+        seasonal, sp = None, None
+    else:
+        print(f"[DEBUG _ets_forecast] ❌ NO se detectó estacionalidad")
+        print(f"   Razón: len(arr)={len(arr)} < {min_teorico} (mínimo teórico)")
+        print(f"   Se usará modelo sin estacionalidad")
+    
     try:
         model = ExponentialSmoothing(
             arr, trend=trend, seasonal=seasonal, seasonal_periods=sp,
             initialization_method='estimated'
         )
         fit = model.fit(optimized=True, use_brute=True)
-        yhat = np.asarray(fit.forecast(horizon), dtype=float)
-        yhat = np.maximum(yhat, 0.0)
+        
+        # DEBUG: Extraer componentes del modelo ajustado si están disponibles
+        if hasattr(fit, 'params'):
+            print(f"[DEBUG _ets_forecast] Parámetros del modelo ajustado:")
+            params = fit.params
+            smoothing_params = []
+            for key in ['smoothing_level', 'smoothing_trend', 'smoothing_seasonal']:
+                if key in params:
+                    val = params[key]
+                    # Manejar valores nan
+                    if pd.isna(val) or np.isnan(val):
+                        print(f"   {key}: nan (no aplica)")
+                    else:
+                        print(f"   {key}: {val:.6f}")
+                        smoothing_params.append(val)
+            
+            # GUARD CRÍTICO: Si todos los parámetros están en 0 o muy cerca de 0, el modelo no se ajustó bien
+            # Esto puede pasar con estacionalidad cuando hay pocos datos
+            # Filtrar valores válidos (no nan) antes de verificar
+            valid_params = [p for p in smoothing_params if not (pd.isna(p) or np.isnan(p))]
+            if valid_params and all(abs(p) < 0.001 for p in valid_params):
+                print(f"[DEBUG _ets_forecast] ⚠️ ADVERTENCIA CRÍTICA: Todos los parámetros de suavizado están en 0")
+                print(f"   Parámetros válidos encontrados: {valid_params}")
+                print(f"   Esto indica que el modelo ETS no se ajustó correctamente")
+                print(f"   Probablemente debido a pocos datos o configuración inadecuada")
+                print(f"   Usando modelo robusto basado en media histórica general (más estable)")
+                return _robust_forecast(pd.Series(arr), horizon), "Robust-Mean (fallback-params-cero)"
+        
+        # DEBUG: Si hay estacionalidad, intentar mostrar los factores estacionales
+        if seasonal == 'add' and sp is not None:
+            try:
+                # statsmodels puede exponer los componentes de diferentes formas
+                if hasattr(fit, 'seasonal'):
+                    seasonal_vals = fit.seasonal
+                    if len(seasonal_vals) >= sp:
+                        print(f"[DEBUG _ets_forecast] Factores estacionales (último ciclo de {sp} períodos):")
+                        last_cycle = seasonal_vals[-sp:]
+                        for i, val in enumerate(last_cycle, 1):
+                            print(f"     Mes {i}: {val:.4f}")
+                        print(f"   Media de factores estacionales: {last_cycle.mean():.4f}")
+                        print(f"   Mínimo factor estacional: {last_cycle.min():.4f} (mes {last_cycle.argmin() + 1})")
+                        print(f"   Máximo factor estacional: {last_cycle.max():.4f} (mes {last_cycle.argmax() + 1})")
+            except Exception as e:
+                print(f"[DEBUG _ets_forecast] No se pudieron extraer factores estacionales: {e}")
+        
+        # DEBUG: Mostrar los últimos valores de la serie para contexto
+        print(f"[DEBUG _ets_forecast] Últimos {min(12, len(arr))} valores de la serie histórica:")
+        for i, val in enumerate(arr[-min(12, len(arr)):], 1):
+            print(f"   Período -{min(12, len(arr)) - i + 1}: {val:.2f}")
+        
+        yhat_raw = np.asarray(fit.forecast(horizon), dtype=float)
+        # DEBUG: Log antes de truncar a 0
+        print(f"[DEBUG _ets_forecast] yhat_raw (antes de truncar): {yhat_raw}")
+        
+        # GUARD: Detectar si hay valores negativos (problema común con ETS estacional aditivo)
+        negativos = (yhat_raw < 0).sum()
+        if negativos > 0:
+            print(f"[DEBUG _ets_forecast] ⚠️ {negativos} valores negativos detectados en la predicción")
+            print(f"   Valores negativos: {yhat_raw[yhat_raw < 0]}")
+            print(f"   Todos los valores yhat_raw: {yhat_raw}")
+            
+            # Calcular estadísticas del histórico para ajuste inteligente
+            hist_mean = arr.mean() if arr.size else 0.0
+            hist_std = arr.std() if arr.size and arr.std() > 0 else hist_mean * 0.3
+            hist_min_positive = arr[arr > 0].min() if (arr > 0).any() else hist_mean * 0.1
+            
+            # Verificar si hay valores positivos en la predicción
+            valores_positivos = (yhat_raw > 0).sum()
+            min_pred = yhat_raw.min()
+            max_pred = yhat_raw.max()
+            
+            print(f"[DEBUG _ets_forecast] Análisis: hist_mean={hist_mean:.2f}, valores_positivos={valores_positivos}, min_pred={min_pred:.2f}, max_pred={max_pred:.2f}")
+            
+            # Solo usar fallback si TODOS los valores son negativos (no solo algunos)
+            if valores_positivos == 0:
+                print(f"[DEBUG _ets_forecast] ⚠️ TODOS los valores son negativos, usando fallback MA6")
+                return _robust_forecast(pd.Series(arr), horizon), "Robust-Mean (fallback-todos-negativos)"
+            
+            # Si hay valores positivos, ajustar los negativos preservando la variación
+            # Estrategia: desplazar solo los valores negativos, manteniendo los positivos intactos
+            if max_pred > 0:
+                # Hay valores positivos: ajustar solo los negativos
+                # Calcular un mínimo razonable basado en el histórico
+                min_reasonable = max(0.0, min(hist_min_positive * 0.15, hist_mean * 0.1))
+                
+                # Aplicar ajuste: los valores negativos se desplazan, los positivos se mantienen
+                yhat = yhat_raw.copy()
+                # Solo ajustar los valores negativos
+                mask_negativos = yhat < 0
+                if mask_negativos.any():
+                    # Calcular el desplazamiento necesario para llevar el mínimo negativo al mínimo razonable
+                    min_negativo = yhat[mask_negativos].min()
+                    shift = min_reasonable - min_negativo
+                    # Aplicar el desplazamiento solo a los valores negativos
+                    yhat[mask_negativos] = yhat[mask_negativos] + shift
+                    # Asegurar que no queden valores negativos después del ajuste
+                    yhat = np.maximum(yhat, 0.0)
+                
+                print(f"[DEBUG _ets_forecast] Ajuste aplicado: min_reasonable={min_reasonable:.2f}")
+                print(f"   yhat antes del ajuste: {yhat_raw}")
+                print(f"   yhat después del ajuste: {yhat}")
+            else:
+                # No debería llegar aquí si valores_positivos > 0, pero por seguridad
+                print(f"[DEBUG _ets_forecast] ⚠️ Caso inesperado, usando fallback MA6")
+                return _robust_forecast(pd.Series(arr), horizon), "Robust-Mean (fallback-inesperado)"
+        else:
+            yhat = np.maximum(yhat_raw, 0.0)
+        
+        # DEBUG: Log después de truncar
+        print(f"[DEBUG _ets_forecast] yhat (después de ajuste): {yhat}")
         tag = f"ETS(A,{ 'A' if trend=='add' else 'N' },{ 'A' if seasonal=='add' else 'N' })"
 
         # GUARD: si ETS se disparó demasiado vs histórico, bajamos a MA6
@@ -159,11 +380,11 @@ def _ets_forecast(arr: np.ndarray, horizon: int, freq: str) -> (np.ndarray, str)
         forecast_mean = yhat.mean() if yhat.size else 0.0
         if hist_mean > 0 and forecast_mean > 4 * hist_mean:
             # demasiado optimista, caer a MA6
-            return _simple_ma6(pd.Series(arr), horizon), "Naive-MA6 (guard)"
+            return _robust_forecast(pd.Series(arr), horizon), "Robust-Mean (guard)"
 
         return yhat, tag
     except Exception:
-        return _simple_ma6(pd.Series(arr), horizon), "Naive-MA6"
+        return _robust_forecast(pd.Series(arr), horizon), "Robust-Mean"
 
 
 # ---------------------------
@@ -206,8 +427,15 @@ def _forecast_per_sku(
     klass: str,
 ) -> (np.ndarray, str):
     arr = np.asarray(full_series.values if isinstance(full_series, pd.Series) else full_series, dtype=float)
+    
+    # DEBUG: Log de entrada a _forecast_per_sku
+    print(f"[DEBUG _forecast_per_sku] arr.size={arr.size}, np.nansum(arr)={np.nansum(arr) if arr.size > 0 else 0}")
+    if arr.size > 0:
+        print(f"   arr (primeros 10): {arr[:min(10, len(arr))]}")
+        print(f"   arr (últimos 10): {arr[-min(10, len(arr)):]}")
 
     if arr.size == 0 or np.nansum(arr) == 0:
+        print(f"[DEBUG _forecast_per_sku] ⚠️ Retornando ceros porque arr.size={arr.size} o suma={np.nansum(arr)}")
         return np.zeros(horizon, dtype=float), "Naive-0"
 
     # nuestra regla más robusta
@@ -289,6 +517,14 @@ def forecast_all(
 
     # Series históricas
     ts = _prep_series(ventas, freq)
+    
+    # DEBUG: Log de series históricas preparadas
+    print(f"[DEBUG forecast_all] Ventas recibidas: {len(ventas)} filas")
+    print(f"[DEBUG forecast_all] Series históricas (ts) después de _prep_series: {len(ts)} filas")
+    if not ts.empty:
+        print(f"[DEBUG forecast_all] SKUs únicos en ts: {sorted(ts['sku'].unique().tolist())}")
+        print(f"[DEBUG forecast_all] Rango de períodos en ts: {ts['period'].min()} a {ts['period'].max()}")
+    
     horizon = 6 if not horizon_override or horizon_override <= 0 else int(horizon_override)
     days_per = _days_per_period(freq)
     total_days = horizon * days_per
@@ -311,6 +547,12 @@ def forecast_all(
     if not inbound_n.empty:
         skus = skus.union(inbound_n["sku"])
     skus = sorted(skus)
+    
+    # DEBUG: Log de universo de SKUs
+    print(f"[DEBUG forecast_all] Universo de SKUs: {skus}")
+    print(f"[DEBUG forecast_all] SKUs en ts (historial): {sorted(set(ts['sku'])) if not ts.empty else '[]'}")
+    print(f"[DEBUG forecast_all] SKUs en stock: {sorted(set(st['sku'])) if not st.empty else '[]'}")
+    print(f"[DEBUG forecast_all] SKUs en config: {sorted(set(cfg['sku'])) if not cfg.empty else '[]'}")
 
     rows_det, rows_res, rows_prop = [], [], []
 
@@ -322,6 +564,32 @@ def forecast_all(
         zr = float(((full == 0).sum() / periods) if periods > 0 else 0.0)
         total_qty_hist = float(full.sum())
         adi, cv2, klass = _classify_adi_cv2(full)
+        
+        # DEBUG: Log específico para cada SKU
+        print(f"[DEBUG forecast_all] Procesando SKU: {sku}")
+        print(f"   hist (raw): {len(hist)} filas, períodos: {hist['period'].tolist() if not hist.empty else '[]'}")
+        if not hist.empty:
+            print(f"   Valores históricos (últimos 12 períodos):")
+            hist_last12 = hist.tail(12) if len(hist) > 12 else hist
+            for _, row in hist_last12.iterrows():
+                print(f"     {row['period'].strftime('%Y-%m')}: {row['qty']:.2f}")
+        print(f"   full (expandido): {len(full)} períodos, suma total: {total_qty_hist}")
+        print(f"   nz (períodos con demanda>0): {nz}, zr (tasa de ceros): {zr}")
+        print(f"   total_qty_hist: {total_qty_hist}")
+        if len(full) > 0:
+            print(f"   Media histórica: {full.mean():.2f}, Mediana: {full.median():.2f}")
+            print(f"   Últimos 6 períodos históricos: {full.tail(6).tolist()}")
+            print(f"   Valores por mes (si es mensual):")
+            if len(full) >= 12:
+                # Agrupar por mes del año para ver estacionalidad
+                meses = {}
+                for idx, val in full.items():
+                    mes = idx.month
+                    if mes not in meses:
+                        meses[mes] = []
+                    meses[mes].append(val)
+                for mes in sorted(meses.keys()):
+                    print(f"     Mes {mes}: media={np.mean(meses[mes]):.2f}, valores={meses[mes]}")
 
         # aquí va el modelo, ahora más robusto
         yhat, model_tag = _forecast_per_sku(
@@ -333,6 +601,10 @@ def forecast_all(
             adi=adi,
             klass=klass,
         )
+        
+        # DEBUG: Log del resultado del modelo
+        print(f"   Modelo usado: {model_tag}")
+        print(f"   yhat (predicción): {yhat}, suma: {np.sum(yhat)}")
 
         # períodos futuros
         if full.empty:
@@ -340,7 +612,16 @@ def forecast_all(
         else:
             last = full.index.max()
             start = (last + pd.offsets.MonthBegin(1)) if freq.upper().startswith("M") else (last + pd.offsets.Week(1))
+        
+        # DEBUG: Log de cálculo de períodos futuros
+        print(f"   Último período histórico: {last if not full.empty else 'N/A'}")
+        print(f"   Start para períodos futuros: {start}")
+        print(f"   Horizon: {horizon}")
+        
         fut_idx = pd.date_range(start, periods=horizon, freq=_freq_code(freq))
+        print(f"   Períodos futuros generados: {[dt.strftime('%Y-%m') for dt in fut_idx]}")
+        print(f"   Valores yhat asignados: {yhat.tolist()}")
+        
         for i, dt in enumerate(fut_idx):
             rows_det.append([run_id, sku, dt.strftime("%Y-%m"), dt, float(yhat[i])])
 
