@@ -2031,11 +2031,15 @@ if modulo_activo == "Compras":
                     horizon_override=horizon,
                 )
                 
-                # DEBUG: Log después de forecast_all (siempre visible si hay problema)
+                # DEBUG: Análisis de estacionalidad (mostrar siempre para SKUs con predicciones constantes)
                 if modo == "Por SKU" and sku_q and not det.empty:
                     sku_target = str(sku_q).strip().upper()
                     det_sku = det[det['sku'] == sku_target]
                     if not det_sku.empty:
+                        # Verificar si todas las predicciones son iguales (predicción constante)
+                        valores_unicos = det_sku['demanda_predicha'].nunique()
+                        es_constante = valores_unicos == 1
+                        
                         # Verificar si hay períodos con demanda_predicha = 0
                         ceros = det_sku[det_sku['demanda_predicha'] == 0]
                         if len(ceros) > 0:
@@ -2053,6 +2057,97 @@ if modulo_activo == "Compras":
                                         st.write(f"**Total_qty_hist:** {res_sku.iloc[0].get('total_qty_hist', 'N/A')}")
                                         st.write(f"**nz (períodos con demanda>0 en histórico):** {res_sku.iloc[0].get('nz', 'N/A')}")
                                         st.write(f"**zr (tasa de ceros en histórico):** {res_sku.iloc[0].get('zr', 'N/A')}")
+                        
+                        # ANÁLISIS DE ESTACIONALIDAD: Mostrar si la predicción es constante
+                        if es_constante and not ventas.empty:
+                            with st.expander("📊 ANÁLISIS DE ESTACIONALIDAD (Predicción constante detectada)", expanded=True):
+                                st.write(f"**SKU:** {sku_target}")
+                                st.write(f"**Predicción constante:** {det_sku.iloc[0]['demanda_predicha']:.4f} para todos los períodos")
+                                
+                                if not res.empty:
+                                    res_sku = res[res['sku'] == sku_target]
+                                    if not res_sku.empty:
+                                        st.write(f"**Modelo usado:** {res_sku.iloc[0]['modelo']}")
+                                
+                                # Analizar estacionalidad desde los datos históricos
+                                import numpy as np
+                                ventas_sku = ventas[ventas['sku'].str.upper() == sku_target].copy()
+                                if not ventas_sku.empty:
+                                    # Agregar por mes (similar a lo que hace predictor_core)
+                                    ventas_sku['period'] = ventas_sku['fecha'].dt.to_period('M').dt.to_timestamp()
+                                    ventas_mensual = ventas_sku.groupby('period', as_index=False)['qty'].sum().sort_values('period')
+                                    
+                                    if len(ventas_mensual) > 0:
+                                        st.write(f"\n**📈 DATOS HISTÓRICOS:**")
+                                        st.write(f"   Períodos únicos: {len(ventas_mensual)}")
+                                        st.write(f"   Rango: {ventas_mensual['period'].min().strftime('%Y-%m')} a {ventas_mensual['period'].max().strftime('%Y-%m')}")
+                                        st.write(f"   Media mensual: {ventas_mensual['qty'].mean():.2f}")
+                                        st.write(f"   Desviación estándar: {ventas_mensual['qty'].std():.2f}")
+                                        
+                                        # Análisis de tendencia (primera mitad vs segunda mitad)
+                                        if len(ventas_mensual) >= 12:
+                                            mid_point = len(ventas_mensual) // 2
+                                            primera_mitad = ventas_mensual.iloc[:mid_point]['qty'].mean()
+                                            segunda_mitad = ventas_mensual.iloc[mid_point:]['qty'].mean()
+                                            trend_ratio = ((segunda_mitad - primera_mitad) / primera_mitad * 100) if primera_mitad > 0 else 0
+                                            
+                                            st.write(f"\n**📉 ANÁLISIS DE TENDENCIA:**")
+                                            st.write(f"   Media primera mitad: {primera_mitad:.2f}")
+                                            st.write(f"   Media segunda mitad: {segunda_mitad:.2f}")
+                                            st.write(f"   Variación: {trend_ratio:+.1f}%")
+                                            st.write(f"   {'✅ Tendencia detectada' if abs(trend_ratio) > 20 else '⚠️  No hay tendencia clara (<20%)'}")
+                                            st.write(f"   *(El modelo requiere >20% para detectar tendencia)*")
+                                        
+                                        # Análisis de estacionalidad por mes del año
+                                        if len(ventas_mensual) >= 12:
+                                            # CORRECCIÓN: Usar ventas_mensual agregadas por mes del año, no registros individuales
+                                            ventas_mensual['mes'] = ventas_mensual['period'].dt.month
+                                            estacionalidad = ventas_mensual.groupby('mes', as_index=False)['qty'].agg({
+                                                'total': 'sum',
+                                                'media_mensual': 'mean',  # Media de los meses agregados (no de registros individuales)
+                                                'conteo_meses': 'count'  # Cuántos meses de ese tipo hay en el histórico
+                                            }).sort_values('mes')
+                                            
+                                            if len(estacionalidad) > 1:
+                                                media_global = ventas_mensual['qty'].mean()
+                                                std_global = ventas_mensual['qty'].std()
+                                                cv = (std_global / media_global) if media_global > 0 else 0
+                                                
+                                                st.write(f"\n**🔄 ANÁLISIS DE ESTACIONALIDAD POR MES:**")
+                                                st.write(f"   Coeficiente de variación (CV): {cv:.3f}")
+                                                st.write(f"   {'Alta variabilidad estacional' if cv > 0.5 else 'Baja variabilidad' if cv < 0.3 else 'Variabilidad moderada'}")
+                                                
+                                                meses_nombres = {
+                                                    1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril",
+                                                    5: "Mayo", 6: "Junio", 7: "Julio", 8: "Agosto",
+                                                    9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre"
+                                                }
+                                                
+                                                st.write(f"\n**Desglose por mes del año (promedio de meses agregados):**")
+                                                for _, row in estacionalidad.iterrows():
+                                                    mes_nombre = meses_nombres.get(row['mes'], f"Mes {row['mes']}")
+                                                    variacion_pct = ((row['media_mensual'] - media_global) / media_global * 100) if media_global > 0 else 0
+                                                    st.write(f"   {mes_nombre:12s}: Total={row['total']:8.2f}, Media mensual={row['media_mensual']:8.2f}, "
+                                                             f"Meses en histórico={int(row['conteo_meses']):2d}, Var={variacion_pct:+6.1f}%")
+                                                
+                                                mes_max = estacionalidad.loc[estacionalidad['media_mensual'].idxmax()]
+                                                mes_min = estacionalidad.loc[estacionalidad['media_mensual'].idxmin()]
+                                                st.write(f"\n   📌 Mes con MAYOR demanda promedio: {meses_nombres.get(mes_max['mes'])} "
+                                                         f"(Media: {mes_max['media_mensual']:.2f})")
+                                                st.write(f"   📌 Mes con MENOR demanda promedio: {meses_nombres.get(mes_min['mes'])} "
+                                                         f"(Media: {mes_min['media_mensual']:.2f})")
+                                                diferencia_pct = ((mes_max['media_mensual'] - mes_min['media_mensual']) / mes_min['media_mensual'] * 100) if mes_min['media_mensual'] > 0 else 0
+                                                st.write(f"   📊 Diferencia: {diferencia_pct:.1f}% (mayor vs menor)")
+                                                st.write(f"\n   ⚠️  **CONCLUSIÓN:** El modelo robusto NO captura estacionalidad mensual,")
+                                                st.write(f"   solo detecta tendencias generales. Si hay estacionalidad pero no tendencia,")
+                                                st.write(f"   la predicción será constante (como se ve aquí).")
+                                        
+                                        # Mostrar últimos períodos
+                                        st.write(f"\n**📅 ÚLTIMOS 12 PERÍODOS HISTÓRICOS:**")
+                                        ultimos_12 = ventas_mensual.tail(12) if len(ventas_mensual) >= 12 else ventas_mensual
+                                        for _, row in ultimos_12.iterrows():
+                                            periodo_str = row['period'].strftime('%Y-%m')
+                                            st.write(f"   {periodo_str}: {row['qty']:8.2f}")
                 
                 # DEBUG: Log completo (solo si mostrar_debug está activado)
                 if mostrar_debug:
