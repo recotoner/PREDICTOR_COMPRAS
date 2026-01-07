@@ -100,13 +100,15 @@ def _simple_ma6(hist: pd.Series, horizon: int) -> np.ndarray:
 
 def _robust_forecast(hist: pd.Series, horizon: int) -> np.ndarray:
     """
-    Modelo robusto que detecta tendencias y proyecta de forma inteligente.
+    Modelo robusto que detecta tendencias y estacionalidad mensual.
     
     Estrategia:
-    1. Si hay suficientes datos, detecta tendencia (creciente/decreciente)
-    2. Usa la media reciente (últimos períodos) como base
-    3. Si hay tendencia clara, la proyecta suavemente
-    4. Si no hay tendencia, usa la media reciente constante
+    1. Si hay suficientes datos (≥12 meses), intenta detectar estacionalidad mensual
+    2. Si hay suficientes datos (≥12 períodos), detecta tendencia (creciente/decreciente)
+    3. Usa la media reciente (últimos períodos) como base
+    4. Si hay tendencia clara, la proyecta suavemente
+    5. Si hay estacionalidad, aplica factores estacionales mensuales
+    6. Si no hay tendencia ni estacionalidad, usa la media reciente constante
     """
     arr = hist.values.astype(float)
     if arr.size == 0:
@@ -119,7 +121,86 @@ def _robust_forecast(hist: pd.Series, horizon: int) -> np.ndarray:
     recent_window = min(6, max(3, total_periods // 2))
     recent_mean = arr[-recent_window:].mean()
     
+    # Media histórica global (para normalización de factores estacionales)
+    hist_mean = arr.mean() if arr.size > 0 else recent_mean
+    
+    # DETECCIÓN DE ESTACIONALIDAD MENSUAL (si tenemos al menos 12 meses de datos)
+    # Esto requiere que hist tenga índices de tipo DatetimeIndex para poder extraer el mes
+    seasonal_factors = None
+    if total_periods >= 12:
+        print(f"[DEBUG _robust_forecast] Intentando detectar estacionalidad (total_periods={total_periods})")
+        try:
+            # Verificar que el índice sea DatetimeIndex
+            if isinstance(hist.index, pd.DatetimeIndex):
+                print(f"[DEBUG _robust_forecast] Índice es DatetimeIndex, tipo: {type(hist.index)}")
+                # Agrupar por mes del año y calcular la media de cada mes
+                meses_medias = {}
+                for idx, val in hist.items():
+                    mes = idx.month
+                    if mes not in meses_medias:
+                        meses_medias[mes] = []
+                    meses_medias[mes].append(val)
+                
+                print(f"[DEBUG _robust_forecast] Meses encontrados en histórico: {sorted(meses_medias.keys())}, total: {len(meses_medias)}")
+                
+                # Calcular media por mes si tenemos todos los meses representados
+                if len(meses_medias) >= 12:  # Tenemos todos los meses del año
+                    # Calcular media por mes
+                    factores = {}
+                    for mes in range(1, 13):
+                        if mes in meses_medias and len(meses_medias[mes]) > 0:
+                            media_mes = np.mean(meses_medias[mes])
+                            factores[mes] = media_mes
+                    
+                    print(f"[DEBUG _robust_forecast] Factores calculados: {len(factores)} meses")
+                    
+                    if len(factores) == 12:
+                        # Calcular promedio de factores para normalización
+                        suma_factores = sum(factores.values())
+                        if suma_factores > 0:
+                            factor_promedio = suma_factores / 12.0
+                            if factor_promedio > 0:
+                                # Normalizar factores para que su promedio sea 1.0
+                                seasonal_factors = {mes: factores[mes] / factor_promedio for mes in factores}
+                                
+                                # Verificar si hay variación estacional significativa (CV de factores > 0.15)
+                                factores_values = list(seasonal_factors.values())
+                                cv_factores = np.std(factores_values) / np.mean(factores_values) if np.mean(factores_values) > 0 else 0
+                                
+                                print(f"[DEBUG _robust_forecast] CV de factores estacionales: {cv_factores:.3f} (umbral: 0.15)")
+                                
+                                if cv_factores < 0.15:  # Variación muy baja, no es estacionalidad real
+                                    print(f"[DEBUG _robust_forecast] ❌ CV demasiado bajo, no se considera estacionalidad")
+                                    seasonal_factors = None
+                                else:
+                                    print(f"[DEBUG _robust_forecast] ✅ Estacionalidad mensual detectada (CV factores: {cv_factores:.3f})")
+                                    # Log de factores para debug
+                                    print(f"   Factores estacionales por mes:")
+                                    meses_nombres = {1:"Ene", 2:"Feb", 3:"Mar", 4:"Abr", 5:"May", 6:"Jun",
+                                                    7:"Jul", 8:"Ago", 9:"Sep", 10:"Oct", 11:"Nov", 12:"Dic"}
+                                    for mes in sorted(seasonal_factors.keys()):
+                                        print(f"     {meses_nombres.get(mes, mes)}: {seasonal_factors[mes]:.3f}")
+                            else:
+                                print(f"[DEBUG _robust_forecast] ❌ Factor promedio <= 0: {factor_promedio}")
+                        else:
+                            print(f"[DEBUG _robust_forecast] ❌ Suma de factores <= 0: {suma_factores}")
+                    else:
+                        print(f"[DEBUG _robust_forecast] ❌ No se tienen los 12 meses, solo {len(factores)}")
+                else:
+                    print(f"[DEBUG _robust_forecast] ❌ Menos de 12 meses únicos encontrados: {len(meses_medias)}")
+            else:
+                print(f"[DEBUG _robust_forecast] ❌ Índice NO es DatetimeIndex, tipo: {type(hist.index)}")
+        except Exception as e:
+            print(f"[DEBUG _robust_forecast] ❌ Error calculando estacionalidad: {e}")
+            import traceback
+            traceback.print_exc()
+            seasonal_factors = None
+    else:
+        print(f"[DEBUG _robust_forecast] ❌ Muy pocos períodos para estacionalidad: {total_periods} < 12")
+    
     # Media de períodos anteriores (para comparar tendencia)
+    has_trend = False
+    smoothed_trend = 0.0
     if total_periods >= 12:
         # Si hay suficientes datos, comparar primera mitad vs segunda mitad
         mid_point = total_periods // 2
@@ -132,24 +213,52 @@ def _robust_forecast(hist: pd.Series, horizon: int) -> np.ndarray:
             has_trend = abs(trend_ratio) > 0.20  # 20% de cambio indica tendencia
             
             if has_trend:
-                # Hay tendencia: proyectar suavemente
-                # Usar la media reciente como base y aplicar una ligera proyección
+                # Hay tendencia: calcular proyección suavizada
                 trend_per_period = (second_half_mean - first_half_mean) / mid_point
-                
-                # Proyección suavizada (no tan agresiva como la tendencia pura)
                 smoothed_trend = trend_per_period * 0.5  # Reducir la tendencia al 50% para suavizar
-                
-                # Generar predicciones con ligera variación basada en tendencia
-                predictions = []
-                for i in range(horizon):
-                    pred = recent_mean + (smoothed_trend * (i + 1))
-                    predictions.append(max(0.0, pred))  # No permitir negativos
-                
-                return np.array(predictions, dtype=float)
+                print(f"[DEBUG _robust_forecast] Tendencia detectada: {trend_ratio*100:+.1f}%")
     
-    # No hay tendencia clara o pocos datos: usar media reciente constante
-    # Esto es más representativo que la media histórica completa
-    return np.full(horizon, recent_mean, dtype=float)
+    # Generar predicciones
+    predictions = []
+    
+    # Determinar el mes de inicio del horizonte de predicción
+    start_month = None
+    if isinstance(hist.index, pd.DatetimeIndex) and len(hist.index) > 0:
+        try:
+            # El último período histórico + 1 período
+            last_period = hist.index[-1]
+            # Calcular el primer mes del horizonte (siguiente mes después del último histórico)
+            if isinstance(last_period, pd.Timestamp):
+                next_period = last_period + pd.offsets.MonthBegin(1)
+                start_month = next_period.month
+        except Exception as e:
+            print(f"[DEBUG _robust_forecast] Error calculando mes de inicio: {e}")
+            pass
+    
+    for i in range(horizon):
+        # Base: media reciente
+        pred = recent_mean
+        
+        # Aplicar tendencia si existe
+        if has_trend:
+            pred = pred + (smoothed_trend * (i + 1))
+        
+        # Aplicar factor estacional mensual si existe
+        if seasonal_factors is not None and start_month is not None:
+            # Calcular el mes correspondiente a esta predicción (i)
+            mes_prediccion = ((start_month - 1 + i) % 12) + 1
+            factor_estacional = seasonal_factors.get(mes_prediccion, 1.0)
+            # Aplicar factor estacional: pred = pred * factor_estacional
+            # Pero ajustar para que mantenga la media reciente como base
+            pred = recent_mean * factor_estacional
+            
+            # Si hay tendencia, también aplicarla sobre el valor estacional
+            if has_trend:
+                pred = pred + (smoothed_trend * (i + 1))
+        
+        predictions.append(max(0.0, pred))  # No permitir negativos
+    
+    return np.array(predictions, dtype=float)
 
 
 # ---------------------------
@@ -214,7 +323,7 @@ def _croston_sba(arr: np.ndarray, horizon: int, alpha: float = 0.1) -> np.ndarra
 # ---------------------------
 # ETS con guardas
 # ---------------------------
-def _ets_forecast(arr: np.ndarray, horizon: int, freq: str) -> (np.ndarray, str):
+def _ets_forecast(arr: np.ndarray, horizon: int, freq: str, full_series: pd.Series = None) -> (np.ndarray, str):
     print(f"\n{'='*60}")
     print(f"[DEBUG _ets_forecast] INICIO - Analizando estacionalidad")
     print(f"{'='*60}")
@@ -224,7 +333,9 @@ def _ets_forecast(arr: np.ndarray, horizon: int, freq: str) -> (np.ndarray, str)
     
     if not _HAS_SM or len(arr) < 3:
         print(f"[DEBUG _ets_forecast] ⚠️ Usando modelo robusto (HAS_SM={_HAS_SM}, len(arr)={len(arr)})")
-        return _robust_forecast(pd.Series(arr), horizon), "Robust-Mean"
+        # Usar full_series si está disponible para preservar DatetimeIndex
+        hist_series = full_series if full_series is not None and isinstance(full_series.index, pd.DatetimeIndex) else pd.Series(arr)
+        return _robust_forecast(hist_series, horizon), "Robust-Mean"
 
     s = _season_length(freq)
     trend = 'add' if len(arr) >= 3 else None
@@ -289,7 +400,9 @@ def _ets_forecast(arr: np.ndarray, horizon: int, freq: str) -> (np.ndarray, str)
                 print(f"   Esto indica que el modelo ETS no se ajustó correctamente")
                 print(f"   Probablemente debido a pocos datos o configuración inadecuada")
                 print(f"   Usando modelo robusto basado en media histórica general (más estable)")
-                return _robust_forecast(pd.Series(arr), horizon), "Robust-Mean (fallback-params-cero)"
+                # Usar full_series si está disponible para preservar DatetimeIndex
+                hist_series = full_series if full_series is not None and isinstance(full_series.index, pd.DatetimeIndex) else pd.Series(arr)
+                return _robust_forecast(hist_series, horizon), "Robust-Mean (fallback-params-cero)"
         
         # DEBUG: Si hay estacionalidad, intentar mostrar los factores estacionales
         if seasonal == 'add' and sp is not None:
@@ -339,7 +452,9 @@ def _ets_forecast(arr: np.ndarray, horizon: int, freq: str) -> (np.ndarray, str)
             # Solo usar fallback si TODOS los valores son negativos (no solo algunos)
             if valores_positivos == 0:
                 print(f"[DEBUG _ets_forecast] ⚠️ TODOS los valores son negativos, usando fallback MA6")
-                return _robust_forecast(pd.Series(arr), horizon), "Robust-Mean (fallback-todos-negativos)"
+                # Usar full_series si está disponible para preservar DatetimeIndex
+                hist_series = full_series if full_series is not None and isinstance(full_series.index, pd.DatetimeIndex) else pd.Series(arr)
+                return _robust_forecast(hist_series, horizon), "Robust-Mean (fallback-todos-negativos)"
             
             # Si hay valores positivos, ajustar los negativos preservando la variación
             # Estrategia: desplazar solo los valores negativos, manteniendo los positivos intactos
@@ -367,7 +482,9 @@ def _ets_forecast(arr: np.ndarray, horizon: int, freq: str) -> (np.ndarray, str)
             else:
                 # No debería llegar aquí si valores_positivos > 0, pero por seguridad
                 print(f"[DEBUG _ets_forecast] ⚠️ Caso inesperado, usando fallback MA6")
-                return _robust_forecast(pd.Series(arr), horizon), "Robust-Mean (fallback-inesperado)"
+                # Usar full_series si está disponible para preservar DatetimeIndex
+                hist_series = full_series if full_series is not None and isinstance(full_series.index, pd.DatetimeIndex) else pd.Series(arr)
+                return _robust_forecast(hist_series, horizon), "Robust-Mean (fallback-inesperado)"
         else:
             yhat = np.maximum(yhat_raw, 0.0)
         
@@ -380,11 +497,15 @@ def _ets_forecast(arr: np.ndarray, horizon: int, freq: str) -> (np.ndarray, str)
         forecast_mean = yhat.mean() if yhat.size else 0.0
         if hist_mean > 0 and forecast_mean > 4 * hist_mean:
             # demasiado optimista, caer a MA6
-            return _robust_forecast(pd.Series(arr), horizon), "Robust-Mean (guard)"
+            # Usar full_series si está disponible para preservar DatetimeIndex
+            hist_series = full_series if full_series is not None and isinstance(full_series.index, pd.DatetimeIndex) else pd.Series(arr)
+            return _robust_forecast(hist_series, horizon), "Robust-Mean (guard)"
 
         return yhat, tag
     except Exception:
-        return _robust_forecast(pd.Series(arr), horizon), "Robust-Mean"
+        # Usar full_series si está disponible para preservar DatetimeIndex
+        hist_series = full_series if full_series is not None and isinstance(full_series.index, pd.DatetimeIndex) else pd.Series(arr)
+        return _robust_forecast(hist_series, horizon), "Robust-Mean"
 
 
 # ---------------------------
@@ -442,8 +563,8 @@ def _forecast_per_sku(
     if _needs_croston(arr, zr, nz, adi, klass):
         return _croston_sba(arr, horizon), "Croston-SBA"
 
-    # si no, ETS con guardas
-    return _ets_forecast(arr, horizon, freq)
+    # si no, ETS con guardas (pasar full_series para preservar DatetimeIndex)
+    return _ets_forecast(arr, horizon, freq, full_series=full_series)
 
 
 # ---------------------------
