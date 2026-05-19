@@ -63,202 +63,30 @@ def _calc_basic_stats(s: pd.Series) -> dict:
         "periodos_con_venta": periodos_con_venta,
         "mean_hist": mean_hist,
         "mean_last6": mean_last6,
+        "meses_winsorizados": 0,
     }
 
 
-# ============================================================
-# Clasificación de demanda (ADI + CV2)
-# ============================================================
-
-def _classify_demand(s: pd.Series) -> tuple:
+def _winsorize_series(s: pd.Series, iqr_factor: float = 2.5) -> tuple[pd.Series, int]:
     """
-    Clasifica la demanda usando ADI (Average Demand Interval) y CV2 (Coefficient of Variation).
-    
-    Clasificación según Syntetos & Boylan (2005):
-    - Smooth: ADI <= 1.32 y CV2 <= 0.49
-    - Intermittent: ADI > 1.32 y CV2 <= 0.49
-    - Erratic: ADI <= 1.32 y CV2 > 0.49
-    - Lumpy: ADI > 1.32 y CV2 > 0.49
-    
-    Parameters
-    ----------
-    s : pd.Series
-        Serie temporal de demanda.
-    
-    Returns
-    -------
-    tuple : (adi, cv2, klass)
-        adi: Average Demand Interval
-        cv2: Coefficient of Variation squared
-        klass: str, una de ['smooth', 'intermittent', 'erratic', 'lumpy']
+    Recorta solo picos altos: valores > Q3 + iqr_factor × IQR pasan a ese tope.
+    No modifica valores bajos. Si IQR <= 0, devuelve la serie sin cambios.
     """
     if s is None or s.empty:
-        return 0.0, 0.0, "smooth"
-    
-    # Solo considerar valores positivos para el cálculo
-    s_pos = s[s > 0]
-    
-    if len(s_pos) == 0:
-        return float('inf'), 0.0, "intermittent"
-    
-    if len(s_pos) == 1:
-        return float(len(s)), 0.0, "intermittent"
-    
-    # ADI: Average Demand Interval (períodos entre demandas)
-    n_periods = len(s)
-    n_demands = len(s_pos)
-    adi = float(n_periods / n_demands) if n_demands > 0 else float('inf')
-    
-    # CV2: Coefficient of Variation squared
-    mean_demand = float(s_pos.mean())
-    if mean_demand > 0:
-        cv2 = float((s_pos.std() / mean_demand) ** 2)
-    else:
-        cv2 = 0.0
-    
-    # Clasificación
-    if adi <= 1.32 and cv2 <= 0.49:
-        klass = "smooth"
-    elif adi > 1.32 and cv2 <= 0.49:
-        klass = "intermittent"
-    elif adi <= 1.32 and cv2 > 0.49:
-        klass = "erratic"
-    else:  # adi > 1.32 and cv2 > 0.49
-        klass = "lumpy"
-    
-    return adi, cv2, klass
-
-
-# ============================================================
-# Métricas de evaluación
-# ============================================================
-
-def _calculate_metrics(hist: pd.Series, fc: pd.Series, validation_periods: int = 6, 
-                       modelo_usado: str = None, freq: str = "M") -> dict:
-    """
-    Calcula métricas de evaluación del forecast usando backtesting real con el mismo modelo.
-    
-    Métricas calculadas:
-    - MAPE: Mean Absolute Percentage Error
-    - RMSE: Root Mean Squared Error
-    - MAE: Mean Absolute Error
-    
-    Hace backtesting real: usa el mismo modelo (ETS, Croston, etc.) que se usó para el forecast
-    para predecir los períodos de validación y comparar con valores reales.
-    
-    Parameters
-    ----------
-    hist : pd.Series
-        Serie histórica completa.
-    fc : pd.Series
-        Serie de forecast (usado para referencia, no para cálculo de métricas).
-    validation_periods : int
-        Número de períodos históricos a usar para validación (default: 6).
-    modelo_usado : str
-        Modelo que se usó para el forecast ('ETS', 'CROSTON_SBA', 'PROM6', etc.).
-    freq : str
-        Frecuencia de la serie ('M' o 'W').
-    
-    Returns
-    -------
-    dict : Diccionario con métricas {'mape', 'rmse', 'mae', 'n_validation'}
-    """
-    if hist is None or hist.empty or fc is None or fc.empty:
-        return {
-            "mape": None,
-            "rmse": None,
-            "mae": None,
-            "n_validation": 0,
-        }
-    
-    # Usar los últimos N períodos para validación (hold-out)
-    if len(hist) < validation_periods + 2:
-        # No hay suficientes datos para validación
-        return {
-            "mape": None,
-            "rmse": None,
-            "mae": None,
-            "n_validation": 0,
-        }
-    
-    # Separar datos en train y validation
-    hist_train = hist.iloc[:-validation_periods]
-    hist_val = hist.tail(validation_periods)
-    
-    if len(hist_train) < 2 or len(hist_val) < 2:
-        return {
-            "mape": None,
-            "rmse": None,
-            "mae": None,
-            "n_validation": len(hist_val),
-        }
-    
-    actual = hist_val.values
-    
-    # Hacer backtesting real usando el mismo modelo que se usó para el forecast
-    predicted = None
-    
-    if modelo_usado == "ETS" and ExponentialSmoothing is not None and len(hist_train) >= 4:
-        try:
-            # Usar ETS para predecir los períodos de validación
-            model = ExponentialSmoothing(
-                hist_train,
-                trend="add",
-                seasonal=None,
-                initialization_method="estimated",
-            )
-            fit = model.fit(optimized=True)
-            fc_val = fit.forecast(len(hist_val))
-            predicted = fc_val.values
-        except Exception:
-            predicted = None
-    
-    elif modelo_usado == "CROSTON_SBA" and len(hist_train) >= 3:
-        try:
-            # Usar Croston SBA para predecir los períodos de validación
-            predicted_array = _croston_sba(hist_train, alpha=0.1, horizon=len(hist_val))
-            predicted = predicted_array
-        except Exception:
-            predicted = None
-    
-    elif modelo_usado in ("PROM6_SHORT", "PROM6_FALLBACK", "PROM6"):
-        # Para modelos de promedio, usar promedio de últimos períodos del train
-        window = min(6, len(hist_train))
-        predicted_value = float(hist_train.tail(window).mean()) if window > 0 else float(hist_train.mean())
-        predicted = np.full(len(actual), predicted_value)
-    
-    # Fallback: si no se pudo usar el modelo, usar promedio simple
-    if predicted is None:
-        predicted_value = float(hist_train.tail(min(6, len(hist_train))).mean()) if len(hist_train) > 0 else 0.0
-        predicted = np.full(len(actual), predicted_value)
-    
-    # Calcular promedio del train para filtros (necesario para el mask)
-    train_mean_total = float(hist_train.mean()) if len(hist_train) > 0 else 0.0
-    
-    # Filtrar valores cero para MAPE (evitar división por cero)
-    # También filtrar valores muy pequeños que pueden inflar el MAPE artificialmente
-    mask = actual > (train_mean_total * 0.1)  # Solo considerar valores > 10% del promedio
-    n_valid = int(mask.sum())
-    
-    if n_valid == 0:
-        mape = None
-    else:
-        # Calcular MAPE solo sobre valores significativos
-        errors_pct = np.abs((actual[mask] - predicted[mask]) / actual[mask]) * 100
-        # Limitar errores extremos (más de 500%) para evitar distorsiones
-        errors_pct = np.clip(errors_pct, 0, 500)
-        mape = float(np.mean(errors_pct))
-    
-    # RMSE y MAE se calculan sobre todos los valores
-    rmse = float(np.sqrt(np.mean((actual - predicted) ** 2)))
-    mae = float(np.mean(np.abs(actual - predicted)))
-    
-    return {
-        "mape": mape,
-        "rmse": rmse,
-        "mae": mae,
-        "n_validation": len(hist_val),
-    }
+        return s, 0
+    s = pd.to_numeric(s, errors="coerce").astype(float)
+    q1 = float(s.quantile(0.25))
+    q3 = float(s.quantile(0.75))
+    iqr = q3 - q1
+    if not np.isfinite(iqr) or iqr <= 0:
+        return s.copy(), 0
+    cap = q3 + iqr_factor * iqr
+    out = s.copy()
+    mask = out > cap
+    n_adj = int(mask.sum())
+    if n_adj > 0:
+        out.loc[mask] = cap
+    return out, n_adj
 
 
 # ============================================================
@@ -403,29 +231,8 @@ def _forecast_one_series(s: pd.Series, freq: str, horizon: int, seasonality_fact
 
     # Índice futuro (continuación natural de la serie)
     last_date = s.index.max()
-    # Calcular el siguiente período de manera compatible con pandas moderno
-    # Usar pd.DateOffset en lugar de to_offset para evitar el error de Timestamp
-    if freq.upper().startswith("M"):
-        # Frecuencia mensual: agregar 1 mes
-        next_date = last_date + pd.DateOffset(months=1)
-    elif freq.upper().startswith("W"):
-        # Frecuencia semanal: agregar 1 semana
-        next_date = last_date + pd.DateOffset(weeks=1)
-    else:
-        # Para otras frecuencias, intentar con to_offset pero usando el método correcto
-        try:
-            offset = pd.tseries.frequencies.to_offset(freq)
-            # En pandas moderno, necesitamos usar el offset de manera diferente
-            if hasattr(offset, 'delta'):
-                next_date = last_date + offset.delta
-            else:
-                next_date = last_date + pd.DateOffset(days=1)  # fallback conservador
-        except Exception:
-            # Fallback: usar 1 día si todo falla
-            next_date = last_date + pd.DateOffset(days=1)
-    
     idx_future = pd.date_range(
-        start=next_date,
+        start=last_date + pd.tseries.frequencies.to_offset(freq),
         periods=horizon,
         freq=freq,
     )
@@ -434,30 +241,32 @@ def _forecast_one_series(s: pd.Series, freq: str, horizon: int, seasonality_fact
     zero_ratio = stats["zero_ratio"]
     periodos_con_venta = stats["periodos_con_venta"]
 
-    # Clasificación ADI+CV2 solo para información (no se usa en selección de modelos)
-    adi, cv2, demand_class = _classify_demand(s)
-
     modelo = "PROM6"
     fc_values = None
 
-    # ---------- Clasificación original (restaurada) ----------
+    # ---------- Clasificación muy simple ----------
     # 1) series muy cortas -> PROM6_SHORT
     if n < 6:
         mean_last = stats["mean_last6"]
         fc_values = np.full(horizon, mean_last, dtype=float)
         modelo = "PROM6_SHORT"
 
-    # 2) series intermitentes -> Croston SBA (lógica original restaurada)
+    # 2) series intermitentes -> Croston SBA
     elif (zero_ratio >= 0.40) and (periodos_con_venta >= 3):
         fc_values = _croston_sba(s, alpha=0.1, horizon=horizon)
         modelo = "CROSTON_SBA"
 
     # 3) resto -> ETS (tendencia), fallback PROM6
     else:
+        stats["meses_winsorizados"] = 0
         if ExponentialSmoothing is not None and n >= 4:
             try:
+                s_ets = s
+                if n >= 6:
+                    s_ets, n_win = _winsorize_series(s)
+                    stats["meses_winsorizados"] = n_win
                 model = ExponentialSmoothing(
-                    s,
+                    s_ets,
                     trend="add",
                     seasonal=None,
                     initialization_method="estimated",
@@ -494,6 +303,9 @@ def _forecast_one_series(s: pd.Series, freq: str, horizon: int, seasonality_fact
             fc_values = fc_values * scale
             fc_mean = target_mean  # solo informativo
 
+    # Ventas proyectadas no pueden ser negativas (ETS aditivo puede cruzar cero).
+    fc_values = np.clip(fc_values, 0, None)
+
     # Construimos la serie forecast con el índice futuro
     fc_series = pd.Series(fc_values, index=idx_future, name="forecast")
 
@@ -504,18 +316,7 @@ def _forecast_one_series(s: pd.Series, freq: str, horizon: int, seasonality_fact
         factors=seasonality_factors,
     )
 
-    # Calcular métricas de evaluación usando el mismo modelo que se usó para el forecast
-    metrics = _calculate_metrics(s, fc_series, validation_periods=min(6, n), 
-                                  modelo_usado=modelo, freq=freq)
-
-    # Agregar clasificación y métricas a stats
-    stats_enhanced = stats.copy()
-    stats_enhanced["adi"] = adi
-    stats_enhanced["cv2"] = cv2
-    stats_enhanced["demand_class"] = demand_class
-    stats_enhanced.update(metrics)
-
-    return s, fc_series, modelo, stats_enhanced
+    return s, fc_series, modelo, stats
 
 
 # ============================================================
@@ -552,19 +353,8 @@ def forecast_sales(
     res : DataFrame
         Resumen por SKU con columnas clave:
         ['sku', 'periodos_hist', 'venta_hist_total',
-         'venta_hist_promedio', 'venta_hist_prom_ult6', 'venta_forecast_total', 'modelo',
-         'zero_ratio', 'periodos_con_venta',
-         'adi', 'cv2', 'demand_class', 'mape', 'rmse', 'mae']
-        
-        Donde:
-        - venta_hist_promedio: Promedio histórico total (todos los períodos)
-        - venta_hist_prom_ult6: Promedio de los últimos 6 meses
-        - adi: Average Demand Interval
-        - cv2: Coefficient of Variation squared
-        - demand_class: Clasificación de demanda ('smooth', 'intermittent', 'erratic', 'lumpy')
-        - mape: Mean Absolute Percentage Error (%)
-        - rmse: Root Mean Squared Error
-        - mae: Mean Absolute Error
+         'venta_hist_promedio', 'venta_forecast_total', 'modelo',
+         'zero_ratio', 'periodos_con_venta', 'meses_winsorizados']
     """
     base_cols = ["fecha", "sku", "venta_neta"]
     for c in base_cols:
@@ -581,17 +371,11 @@ def forecast_sales(
                 "periodos_hist",
                 "venta_hist_total",
                 "venta_hist_promedio",
-                "venta_hist_prom_ult6",
                 "venta_forecast_total",
                 "modelo",
                 "zero_ratio",
                 "periodos_con_venta",
-                "adi",
-                "cv2",
-                "demand_class",
-                "mape",
-                "rmse",
-                "mae",
+                "meses_winsorizados",
             ]
         )
         return det_empty, res_empty
@@ -618,7 +402,14 @@ def forecast_sales(
             seasonality_factors=seasonality_factors,
         )
 
-        # detalle histórico
+        meses_win = int(stats.get("meses_winsorizados", 0) or 0)
+        if meses_win > 0:
+            print(
+                f"[predictor_sales] Winsorización ETS: {sku} — "
+                f"{meses_win} mes(es) ajustados (tope Q3 + 2.5×IQR)."
+            )
+
+        # detalle histórico (valores brutos del Excel, no la serie winsorizada)
         for fecha, val in hist.items():
             det_rows.append(
                 {
@@ -640,10 +431,7 @@ def forecast_sales(
             )
 
         venta_hist_total = float(hist.sum()) if len(hist) else 0.0
-        # Promedio total histórico (todos los períodos)
-        venta_hist_prom_total = float(hist.mean()) if len(hist) > 0 else 0.0
-        # Promedio de últimos 6 meses (para comparar con tendencia reciente)
-        venta_hist_prom_ult6 = float(
+        venta_hist_prom = float(
             hist.tail(min(6, len(hist))).mean()
         ) if len(hist) else 0.0
         venta_fc_total = float(fc.sum()) if len(fc) else 0.0
@@ -653,19 +441,12 @@ def forecast_sales(
                 "sku": sku,
                 "periodos_hist": int(len(hist)),
                 "venta_hist_total": venta_hist_total,
-                "venta_hist_promedio": venta_hist_prom_total,  # Cambiado: ahora es promedio total
-                "venta_hist_prom_ult6": venta_hist_prom_ult6,  # Nuevo: promedio últimos 6 meses
+                "venta_hist_promedio": venta_hist_prom,
                 "venta_forecast_total": venta_fc_total,
                 "modelo": modelo,
                 "zero_ratio": stats["zero_ratio"],
                 "periodos_con_venta": stats["periodos_con_venta"],
-                # Nuevas métricas y clasificación
-                "adi": stats.get("adi", None),
-                "cv2": stats.get("cv2", None),
-                "demand_class": stats.get("demand_class", "unknown"),
-                "mape": stats.get("mape", None),
-                "rmse": stats.get("rmse", None),
-                "mae": stats.get("mae", None),
+                "meses_winsorizados": meses_win,
             }
         )
 
