@@ -21,6 +21,7 @@ except ImportError:
     forecast_sales = None
 
 from V2.excel_config_defaults import default_config_from_union
+from V2.excel_config_merge import CONFIG_GLOBAL_SKU, build_config_final, normalize_config_upload
 from V2.excel_kame_loader import (
     load_inbound_oc_kame,
     load_inbound_oc_kame_bytes,
@@ -598,7 +599,7 @@ def _upload_file_status_html(uploaded) -> str:
 
 
 def _render_excel_upload_sidebar() -> tuple:
-    """UI de carga en sidebar (modo subir archivos). Devuelve (up_ventas, up_stock, up_oc)."""
+    """UI de carga en sidebar (modo subir archivos). Devuelve (up_ventas, up_stock, up_oc, up_config)."""
     with st.sidebar:
         st.markdown("### 📁 Carga de archivos")
         st.caption("Solo en esta sesión · .xlsx / .xls · no se guarda en disco")
@@ -654,7 +655,57 @@ def _render_excel_upload_sidebar() -> tuple:
         )
         st.markdown(_upload_file_status_html(up_oc), unsafe_allow_html=True)
 
-    return up_ventas, up_stock, up_oc
+        st.markdown(
+            """
+            <div class="upload-card">
+                <p class="upload-card-title">⚙️ Parámetros de compra (opcional)</p>
+                <p class="upload-card-hint">sku, lead_time, seguridad, mínimo, múltiplo · fila GLOBAL</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        up_config = st.file_uploader(
+            "Seleccionar Excel de parámetros de compra",
+            type=["xlsx", "xls"],
+            label_visibility="collapsed",
+            key="up_config",
+        )
+        st.markdown(_upload_file_status_html(up_config), unsafe_allow_html=True)
+
+    return up_ventas, up_stock, up_oc, up_config
+
+
+def _pick_config_excel_in_folder(folder: Path) -> Path | None:
+    for token in ("config_compras", "config", "parametros"):
+        found = pick_excel_in_folder(folder, token)
+        if found is not None:
+            return found
+    return None
+
+
+def _read_config_raw_optional(
+    up_config,
+    folder: Path,
+    *,
+    from_upload_mode: bool,
+) -> tuple[pd.DataFrame | None, str | None]:
+    """Lee config opcional; devuelve (raw_df o None, mensaje para log)."""
+    if from_upload_mode:
+        if up_config is None:
+            return None, None
+        b_c, err_c = _read_upload_bytes(up_config)
+        if err_c:
+            raise ValueError(err_c)
+        name_c = up_config.name
+        raw = read_first_sheet_bytes(
+            b_c, ("config", "parametros", "Config", "Parámetros")
+        )
+        return raw, f"✅ Config compras: {name_c} (desde upload)"
+    pc = _pick_config_excel_in_folder(folder)
+    if pc is None:
+        return None, None
+    raw = read_first_sheet_path(pc, ("config", "parametros", "Config", "Parámetros"))
+    return raw, f"✅ Config compras: {pc.name} (carpeta local)"
 
 
 def _style_reporteria_table(df: pd.DataFrame):
@@ -2300,11 +2351,11 @@ fuente = st.radio(
     horizontal=True,
 )
 
-up_ventas = up_stock = up_oc = None
+up_ventas = up_stock = up_oc = up_config = None
 excel_dir = str(DEFAULT_EXCEL_DIR)
 
 if fuente.startswith("Subir"):
-    up_ventas, up_stock, up_oc = _render_excel_upload_sidebar()
+    up_ventas, up_stock, up_oc, up_config = _render_excel_upload_sidebar()
 else:
     with st.sidebar:
         st.markdown("### 📁 Carpeta local (pruebas)")
@@ -2330,6 +2381,7 @@ if st.button("Cargar Excel y ejecutar predicción", type="primary", use_containe
     st.session_state[SESSION_SECTION_NAV_KEY] = _SECTION_LABELS[0]
     upload_run_log: tuple[str, bool] | None = None
     raw_ventas_df = pd.DataFrame()
+    raw_config_df: pd.DataFrame | None = None
 
     if fuente.startswith("Subir"):
         fallback_folder = DEFAULT_EXCEL_DIR
@@ -2493,6 +2545,20 @@ if st.button("Cargar Excel y ejecutar predicción", type="primary", use_containe
             all(line.startswith("✅") for line in source_log),
         )
 
+        try:
+            raw_config_df, cfg_log = _read_config_raw_optional(
+                up_config, fallback_folder, from_upload_mode=True
+            )
+            if cfg_log:
+                source_log.append(cfg_log)
+                upload_run_log = (
+                    "Origen de los datos\n\n" + "\n".join(source_log),
+                    all(line.startswith("✅") for line in source_log),
+                )
+        except Exception as e:
+            st.error(f"No se pudo leer el Excel de parámetros de compra: {e}")
+            st.stop()
+
     else:
         folder = Path(excel_dir)
         if not folder.is_dir():
@@ -2538,7 +2604,30 @@ if st.button("Cargar Excel y ejecutar predicción", type="primary", use_containe
         for msg in _validate_canonical_stock(stock):
             st.warning(msg)
 
-    config = default_config_from_union(ventas, stock)
+        try:
+            raw_config_df, cfg_log = _read_config_raw_optional(
+                None, folder, from_upload_mode=False
+            )
+            if cfg_log:
+                st.info(cfg_log)
+        except Exception as e:
+            st.error(f"No se pudo leer el Excel de parámetros de compra: {e}")
+            st.stop()
+
+    config = build_config_final(ventas, stock, raw_config_df)
+    config_applied = (
+        raw_config_df is not None
+        and not raw_config_df.empty
+        and not normalize_config_upload(raw_config_df).empty
+    )
+    if config_applied:
+        parsed_cfg = normalize_config_upload(raw_config_df)
+        n_cfg_sku = int((parsed_cfg["sku"] != CONFIG_GLOBAL_SKU).sum())
+        st.success(
+            f"⚙️ **Parámetros de compra aplicados** "
+            f"({n_cfg_sku} SKU(s) en archivo"
+            f"{', fila GLOBAL' if (parsed_cfg['sku'] == CONFIG_GLOBAL_SKU).any() else ''})."
+        )
 
     ventas_raw_full = raw_ventas_df.copy()
 
@@ -2575,6 +2664,8 @@ if st.button("Cargar Excel y ejecutar predicción", type="primary", use_containe
         "ventas": ventas.copy(),
         "stock": stock.copy(),
         "inbound": inbound.copy(),
+        "config": config.copy(),
+        "config_applied": config_applied,
         "det": det.copy(),
         "res": res.copy(),
         "prop": prop.copy(),
@@ -2606,6 +2697,8 @@ if run is not None:
             st.dataframe(run["ventas"].head(20), use_container_width=True)
             st.dataframe(run["stock"].head(20), use_container_width=True)
             st.dataframe(run["inbound"].head(50), use_container_width=True)
+            st.caption("Parámetros de compra (config final enviada al core)")
+            st.dataframe(run.get("config", pd.DataFrame()).head(50), use_container_width=True)
         ul = run.get("upload_run_log")
         if ul is not None:
             log_body, all_from_upload = ul

@@ -13,6 +13,19 @@ except Exception:  # statsmodels puede no estar instalado; usamos fallback
 # Helpers de series
 # ============================================================
 
+def _pandas_offset_freq(freq: str) -> str:
+    """
+    Convierte alias de la app ('M' mensual, 'W' semanal) al offset de pandas vigente.
+    'M' está deprecado desde pandas 2.2+ → usar 'ME' (fin de mes), mismo comportamiento histórico.
+    """
+    f = str(freq).strip().upper()
+    if f in ("M", "BM"):
+        return "ME"
+    if f == "MS":
+        return "MS"
+    return str(freq).strip()
+
+
 def _build_series(df_sku: pd.DataFrame, freq: str) -> pd.Series:
     """
     Recibe un DF filtrado a un SKU, con columnas ['fecha', 'venta_neta'].
@@ -31,7 +44,7 @@ def _build_series(df_sku: pd.DataFrame, freq: str) -> pd.Series:
         return s
 
     s = pd.to_numeric(s, errors="coerce").fillna(0.0)
-    s_agg = s.resample('ME' if freq == 'M' else freq).sum()
+    s_agg = s.resample(_pandas_offset_freq(freq)).sum()
     # quitamos períodos completamente vacíos
     s_agg = s_agg[s_agg.notna()]
     return s_agg.astype(float)
@@ -215,16 +228,18 @@ def _forecast_one_series(s: pd.Series, freq: str, horizon: int, seasonality_fact
     """
     stats = _calc_basic_stats(s)
 
+    pd_freq = _pandas_offset_freq(freq)
+
     if stats["n"] == 0:
         # sin historia, forecast = 0
         idx_future = pd.date_range(
             start=pd.Timestamp.today().normalize(),
             periods=horizon,
-            freq=('ME' if freq == 'M' else freq),
+            freq=pd_freq,
         )
         fc = pd.Series(0.0, index=idx_future, name="forecast")
         # también aplicamos estacionalidad por consistencia (aunque es todo 0)
-        fc = _apply_manual_seasonality(fc, freq=('ME' if freq == 'M' else freq), factors=seasonality_factors)
+        fc = _apply_manual_seasonality(fc, freq=freq, factors=seasonality_factors)
         return s, fc, "NO_DATA", stats
 
     s = s.astype(float).fillna(0.0)
@@ -232,9 +247,9 @@ def _forecast_one_series(s: pd.Series, freq: str, horizon: int, seasonality_fact
     # Índice futuro (continuación natural de la serie)
     last_date = s.index.max()
     idx_future = pd.date_range(
-        start=last_date + pd.tseries.frequencies.to_offset(freq),
+        start=last_date + pd.tseries.frequencies.to_offset(pd_freq),
         periods=horizon,
-        freq=('ME' if freq == 'M' else freq),
+        freq=pd_freq,
     )
 
     n = stats["n"]
@@ -312,7 +327,7 @@ def _forecast_one_series(s: pd.Series, freq: str, horizon: int, seasonality_fact
     # Ajuste estacional manual (si hay factores configurados)
     fc_series = _apply_manual_seasonality(
         fc_series,
-        freq=('ME' if freq == 'M' else freq),
+        freq=freq,
         factors=seasonality_factors,
     )
 
@@ -394,10 +409,10 @@ def forecast_sales(
     res_rows = []
 
     for sku, df_sku in ventas2.groupby("sku"):
-        serie = _build_series(df_sku, freq=('ME' if freq == 'M' else freq))
+        serie = _build_series(df_sku, freq=freq)
         hist, fc, modelo, stats = _forecast_one_series(
             serie,
-            freq=('ME' if freq == 'M' else freq),
+            freq=freq,
             horizon=horizon,
             seasonality_factors=seasonality_factors,
         )
