@@ -31,7 +31,7 @@ def _build_series(df_sku: pd.DataFrame, freq: str) -> pd.Series:
         return s
 
     s = pd.to_numeric(s, errors="coerce").fillna(0.0)
-    s_agg = s.resample(freq).sum()
+    s_agg = s.resample('ME' if freq == 'M' else freq).sum()
     # quitamos períodos completamente vacíos
     s_agg = s_agg[s_agg.notna()]
     return s_agg.astype(float)
@@ -220,11 +220,11 @@ def _forecast_one_series(s: pd.Series, freq: str, horizon: int, seasonality_fact
         idx_future = pd.date_range(
             start=pd.Timestamp.today().normalize(),
             periods=horizon,
-            freq=freq,
+            freq=('ME' if freq == 'M' else freq),
         )
         fc = pd.Series(0.0, index=idx_future, name="forecast")
         # también aplicamos estacionalidad por consistencia (aunque es todo 0)
-        fc = _apply_manual_seasonality(fc, freq=freq, factors=seasonality_factors)
+        fc = _apply_manual_seasonality(fc, freq=('ME' if freq == 'M' else freq), factors=seasonality_factors)
         return s, fc, "NO_DATA", stats
 
     s = s.astype(float).fillna(0.0)
@@ -234,7 +234,7 @@ def _forecast_one_series(s: pd.Series, freq: str, horizon: int, seasonality_fact
     idx_future = pd.date_range(
         start=last_date + pd.tseries.frequencies.to_offset(freq),
         periods=horizon,
-        freq=freq,
+        freq=('ME' if freq == 'M' else freq),
     )
 
     n = stats["n"]
@@ -312,7 +312,7 @@ def _forecast_one_series(s: pd.Series, freq: str, horizon: int, seasonality_fact
     # Ajuste estacional manual (si hay factores configurados)
     fc_series = _apply_manual_seasonality(
         fc_series,
-        freq=freq,
+        freq=('ME' if freq == 'M' else freq),
         factors=seasonality_factors,
     )
 
@@ -394,10 +394,10 @@ def forecast_sales(
     res_rows = []
 
     for sku, df_sku in ventas2.groupby("sku"):
-        serie = _build_series(df_sku, freq=freq)
+        serie = _build_series(df_sku, freq=('ME' if freq == 'M' else freq))
         hist, fc, modelo, stats = _forecast_one_series(
             serie,
-            freq=freq,
+            freq=('ME' if freq == 'M' else freq),
             horizon=horizon,
             seasonality_factors=seasonality_factors,
         )
