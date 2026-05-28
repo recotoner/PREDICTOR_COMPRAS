@@ -23,6 +23,7 @@ except ImportError:
 from V2.excel_config_defaults import default_config_from_union
 from V2.excel_config_merge import CONFIG_GLOBAL_SKU, build_config_final, normalize_config_upload
 from V2.excel_kame_loader import (
+    build_sku_producto_map,
     load_inbound_oc_kame,
     load_inbound_oc_kame_bytes,
     load_pack_from_folder,
@@ -98,6 +99,295 @@ def _validate_canonical_stock(stock: pd.DataFrame) -> list[str]:
     return msgs
 
 
+PRODUCTO_COL = "producto"
+
+
+def _attach_producto(
+    df: pd.DataFrame | None,
+    sku_producto: dict[str, str] | None,
+) -> pd.DataFrame:
+    """Añade columna producto junto a sku (desde export de ventas)."""
+    if df is None:
+        return pd.DataFrame()
+    if df.empty or not sku_producto or "sku" not in df.columns:
+        return df
+    out = df.copy()
+    if PRODUCTO_COL in out.columns:
+        out = out.drop(columns=[PRODUCTO_COL])
+    skus = out["sku"].astype(str).str.strip().str.upper()
+    out.insert(
+        int(out.columns.get_loc("sku")) + 1,
+        PRODUCTO_COL,
+        skus.map(sku_producto).fillna(""),
+    )
+    return out
+
+
+RELIABILITY_COLS = (
+    "estado_prediccion",
+    "confianza_prediccion",
+    "accion_recomendada",
+    "nota_prediccion",
+    "alerta_datos",
+    "demanda_referencial",
+)
+
+
+def _reliability_fields_from_nz(
+    nz: int,
+    periods: int,
+    zr: float,
+    total_qty_hist: float,
+) -> dict[str, str]:
+    """Reglas de confiabilidad según nz + señales de historial (periods, zr, total)."""
+    nz_val = pd.to_numeric(nz, errors="coerce")
+    periods_val = pd.to_numeric(periods, errors="coerce")
+    zr_val = pd.to_numeric(zr, errors="coerce")
+    total_qty_hist_val = pd.to_numeric(total_qty_hist, errors="coerce")
+    nz = 0 if pd.isna(nz_val) else int(nz_val)
+    periods = 0 if pd.isna(periods_val) else int(periods_val)
+    zr = 1.0 if pd.isna(zr_val) else float(zr_val)
+    total_qty_hist = 0.0 if pd.isna(total_qty_hist_val) else float(total_qty_hist_val)
+    if nz == 0:
+        return {
+            "estado_prediccion": "SIN_HISTORIAL",
+            "confianza_prediccion": "SIN_BASE",
+            "accion_recomendada": "NO_PREDECIR",
+            "nota_prediccion": (
+                "Sin ventas históricas suficientes para proyectar. Revisar manualmente."
+            ),
+        }
+    if nz == 1:
+        return {
+            "estado_prediccion": "HISTORIAL_INSUFICIENTE",
+            "confianza_prediccion": "BAJA",
+            "accion_recomendada": "REVISAR_NO_COMPRAR_AUTOMATICO",
+            "nota_prediccion": (
+                "Solo 1 período con venta. Forecast referencial basado en repetir el único "
+                "período observado. La demanda estimada es referencial y no debe usarse "
+                "como compra automática."
+            ),
+        }
+    if nz == 2:
+        return {
+            "estado_prediccion": "HISTORIAL_BAJO",
+            "confianza_prediccion": "BAJA",
+            "accion_recomendada": "REVISAR",
+            "nota_prediccion": (
+                "Pocos períodos con demanda. Validar antes de comprar."
+            ),
+        }
+    if 3 <= nz < 6:
+        return {
+            "estado_prediccion": "PREDICCION_LIMITADA",
+            "confianza_prediccion": "MEDIA_BAJA",
+            "accion_recomendada": "REVISAR_CON_CRITERIO",
+            "nota_prediccion": (
+                "Historial limitado. Predicción útil como apoyo, no como decisión automática."
+            ),
+        }
+    if nz >= 12 and periods >= 12 and zr <= 0.25 and total_qty_hist > 0:
+        return {
+            "estado_prediccion": "PREDICCION_OK",
+            "confianza_prediccion": "ALTA",
+            "accion_recomendada": "USAR_COMO_REFERENCIA",
+            "nota_prediccion": "Predicción basada en historial amplio y demanda recurrente.",
+        }
+
+    return {
+        "estado_prediccion": "PREDICCION_OK",
+        "confianza_prediccion": "MEDIA",
+        "accion_recomendada": "USAR_COMO_REFERENCIA",
+        "nota_prediccion": "Predicción basada en historial suficiente.",
+    }
+
+
+def _expired_inbound_alert_by_sku(
+    inbound: pd.DataFrame | None,
+    as_of: pd.Timestamp | None = None,
+) -> dict[str, str]:
+    """
+    OC pendientes con ETA anterior a la fecha de corrida: alerta de calidad de datos.
+    No modifica el cálculo del core (inbound futuro válido sí descuenta compra).
+    """
+    if inbound is None or inbound.empty:
+        return {}
+    if "sku" not in inbound.columns or "qty" not in inbound.columns:
+        return {}
+    today = (as_of or pd.Timestamp.today()).normalize()
+    df = inbound.copy()
+    df["sku"] = df["sku"].astype(str).str.strip().str.upper()
+    df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0.0)
+    if "eta" in df.columns:
+        df["eta"] = pd.to_datetime(df["eta"], errors="coerce", dayfirst=True)
+    else:
+        return {}
+    expired = df[(df["qty"] > 0) & df["eta"].notna() & (df["eta"] < today)]
+    if expired.empty:
+        return {}
+    qty_by_sku = expired.groupby("sku", observed=True)["qty"].sum()
+    out: dict[str, str] = {}
+    for sku, qty in qty_by_sku.items():
+        q = float(qty)
+        if q <= 0:
+            continue
+        q_txt = str(int(round(q))) if abs(q - round(q)) < 1e-9 else f"{q:.2f}"
+        out[str(sku)] = (
+            f"OC pendiente vencida detectada por {q_txt} unidades. "
+            "No considerada como inbound válido."
+        )
+    return out
+
+
+def _enrich_compras_prediction_reliability(
+    res: pd.DataFrame,
+    prop: pd.DataFrame,
+    inbound: pd.DataFrame | None,
+    *,
+    as_of: pd.Timestamp | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Añade columnas de confiabilidad a Resumen y Propuesta (sin tocar predictor_core)."""
+    if res is None or res.empty:
+        return res, prop
+    res_out = res.copy()
+    prop_out = prop.copy() if prop is not None else pd.DataFrame()
+
+    oc_alerts = _expired_inbound_alert_by_sku(inbound, as_of=as_of)
+    rows: list[dict[str, object]] = []
+    for _, row in res_out.iterrows():
+        sku = str(row.get("sku", "")).strip().upper()
+        nz_val = pd.to_numeric(row.get("nz", 0), errors="coerce")
+        periods_val = pd.to_numeric(row.get("periods", 0), errors="coerce")
+        zr_val = pd.to_numeric(row.get("zr", 1.0), errors="coerce")
+        total_qty_hist_val = pd.to_numeric(row.get("total_qty_hist", 0.0), errors="coerce")
+        nz = 0 if pd.isna(nz_val) else int(nz_val)
+        periods = 0 if pd.isna(periods_val) else int(periods_val)
+        zr = 1.0 if pd.isna(zr_val) else float(zr_val)
+        total_qty_hist = 0.0 if pd.isna(total_qty_hist_val) else float(total_qty_hist_val)
+        rel = _reliability_fields_from_nz(
+            nz=nz,
+            periods=periods,
+            zr=zr,
+            total_qty_hist=total_qty_hist,
+        )
+        demanda_h = float(pd.to_numeric(row.get("demanda_H", 0), errors="coerce") or 0.0)
+        alerta = oc_alerts.get(sku, "")
+        rows.append(
+            {
+                "sku": sku,
+                "demanda_referencial": round(demanda_h, 4),
+                "alerta_datos": alerta,
+                **rel,
+            }
+        )
+    rel_df = pd.DataFrame(rows)
+    for col in RELIABILITY_COLS:
+        if col in res_out.columns:
+            res_out = res_out.drop(columns=[col])
+    res_out = res_out.merge(rel_df, on="sku", how="left")
+    for col in RELIABILITY_COLS:
+        if col not in res_out.columns:
+            res_out[col] = ""
+        if col == "demanda_referencial":
+            res_out[col] = pd.to_numeric(res_out[col], errors="coerce").fillna(0.0)
+        else:
+            res_out[col] = res_out[col].fillna("").astype(str)
+
+    # Propuesta: mismas columnas por SKU
+    if not prop_out.empty and "sku" in prop_out.columns:
+        prop_rel = rel_df[
+            ["sku", *RELIABILITY_COLS]
+        ].copy()
+        for col in RELIABILITY_COLS:
+            if col in prop_out.columns:
+                prop_out = prop_out.drop(columns=[col])
+        prop_out["sku"] = prop_out["sku"].astype(str).str.strip().str.upper()
+        prop_out = prop_out.merge(prop_rel, on="sku", how="left")
+        for col in RELIABILITY_COLS:
+            if col not in prop_out.columns:
+                prop_out[col] = ""
+            if col == "demanda_referencial":
+                prop_out[col] = pd.to_numeric(prop_out[col], errors="coerce").fillna(0.0)
+            else:
+                prop_out[col] = prop_out[col].fillna("").astype(str)
+
+    return res_out, prop_out
+
+
+def _show_compras_reliability_summary(res: pd.DataFrame) -> None:
+    """Banner con conteo de SKUs por nivel de confianza."""
+    if res is None or res.empty or "estado_prediccion" not in res.columns:
+        return
+    insuf = int((res["estado_prediccion"] == "HISTORIAL_INSUFICIENTE").sum())
+    sin_hist = int((res["estado_prediccion"] == "SIN_HISTORIAL").sum())
+    oc_alert = int(
+        (res.get("alerta_datos", pd.Series(dtype=str)).astype(str).str.strip() != "").sum()
+    )
+    if insuf > 0:
+        st.warning(
+            f"**{insuf}** SKU(s) con **historial insuficiente** (1 solo período con venta). "
+            "La demanda es **referencial**; no usar como compra automática."
+        )
+    if sin_hist > 0:
+        st.info(
+            f"**{sin_hist}** SKU(s) **sin historial de ventas** en el archivo "
+            "(acción sugerida: NO_PREDECIR / revisar manualmente)."
+        )
+    if oc_alert > 0:
+        st.warning(
+            f"**{oc_alert}** SKU(s) con **OC pendiente vencida** en los datos "
+            "(no se considera inbound válido; revisar limpieza del export)."
+        )
+
+
+def _realign_compras_detalle_to_global_calendar(
+    det: pd.DataFrame,
+    ventas: pd.DataFrame,
+    freq: str,
+    horizon: int,
+) -> pd.DataFrame:
+    """Realinea solo period/fecha_periodo de compras a un horizonte global común."""
+    if det is None or det.empty:
+        return det
+    if ventas is None or ventas.empty or "fecha" not in ventas.columns:
+        return det
+    if not {"sku", "period", "fecha_periodo"}.issubset(det.columns):
+        return det
+    horizon = int(horizon or 0)
+    if horizon <= 0:
+        return det
+
+    fechas = pd.to_datetime(ventas["fecha"], errors="coerce").dropna()
+    if fechas.empty:
+        return det
+
+    is_monthly = str(freq).upper().startswith("M")
+    period_code = "M" if is_monthly else "W"
+    global_last_period = fechas.dt.to_period(period_code).max().to_timestamp()
+    if pd.isna(global_last_period):
+        return det
+
+    start = (
+        global_last_period + pd.offsets.MonthBegin(1)
+        if is_monthly
+        else global_last_period + pd.offsets.Week(1)
+    )
+    future_idx = pd.date_range(
+        start,
+        periods=horizon,
+        freq="MS" if is_monthly else "W-MON",
+    )
+
+    out = det.copy()
+    sku_key = out["sku"].astype(str).str.strip().str.upper()
+    pos = out.groupby(sku_key, sort=False).cumcount()
+    for i, dt in enumerate(future_idx):
+        mask = pos == i
+        out.loc[mask, "fecha_periodo"] = dt
+        out.loc[mask, "period"] = dt.strftime("%Y-%m")
+    return out
+
+
 def _prediction_tables_to_excel_bytes(
     det: pd.DataFrame, res: pd.DataFrame, prop: pd.DataFrame
 ) -> bytes:
@@ -145,6 +435,7 @@ def _ventas_forecast_to_excel_bytes(
     month_trim_meta: dict | None,
     sku_count: int,
     total_hist: float,
+    sku_producto: dict[str, str] | None = None,
 ) -> bytes:
     """
     Excel alineado con la tarjeta «Venta proyectada (horizonte)» y barras rojas del gráfico.
@@ -207,17 +498,54 @@ def _ventas_forecast_to_excel_bytes(
     det_fc = _det_forecast_en_ventana_calendario(
         det_v, ventas_ext, raw_ventas, month_trim_meta
     )
+    suma_proy_mensual = (
+        float(pd.to_numeric(proy_mensual["monto_proyectado_CLP"], errors="coerce").fillna(0.0).sum())
+        if not proy_mensual.empty and "monto_proyectado_CLP" in proy_mensual.columns
+        else 0.0
+    )
+    suma_detalle = (
+        float(pd.to_numeric(det_fc["venta_neta"], errors="coerce").fillna(0.0).sum())
+        if not det_fc.empty and "venta_neta" in det_fc.columns
+        else 0.0
+    )
+    diferencia = suma_proy_mensual - total_fc
+    diferencia_detalle = suma_detalle - total_fc
+    control = pd.DataFrame(
+        [
+            {
+                "control": "total_fc_hoja_totales",
+                "monto_CLP": total_fc,
+                "diferencia_vs_total_fc": 0.0,
+                "cuadra_con_total_fc": True,
+            },
+            {
+                "control": "suma_proyeccion_mensual",
+                "monto_CLP": suma_proy_mensual,
+                "diferencia_vs_total_fc": diferencia,
+                "cuadra_con_total_fc": abs(diferencia) <= 1,
+            },
+            {
+                "control": "suma_detalle_proyeccion_venta_neta",
+                "monto_CLP": suma_detalle,
+                "diferencia_vs_total_fc": diferencia_detalle,
+                "cuadra_con_total_fc": abs(diferencia_detalle) <= 1,
+            },
+        ]
+    )
     det_show = _sort_sales_det_for_display(det_fc) if not det_fc.empty else det_fc
+    det_xlsx = _attach_producto(det_show, sku_producto)
+    res_xlsx = _attach_producto(res_v, sku_producto) if res_v is not None else res_v
 
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         nota.to_excel(writer, sheet_name="Leeme", index=False)
         totales.to_excel(writer, sheet_name="Totales", index=False)
         proy_mensual.to_excel(writer, sheet_name="Proyeccion_mensual", index=False)
-        if det_show is not None and not det_show.empty:
-            det_show.to_excel(writer, sheet_name="Detalle_proyeccion", index=False)
-        if res_v is not None and not res_v.empty:
-            res_v.to_excel(writer, sheet_name="Resumen_SKU_referencia", index=False)
+        control.to_excel(writer, sheet_name="Control_cuadratura", index=False)
+        if det_xlsx is not None and not det_xlsx.empty:
+            det_xlsx.to_excel(writer, sheet_name="Detalle_proyeccion", index=False)
+        if res_xlsx is not None and not res_xlsx.empty:
+            res_xlsx.to_excel(writer, sheet_name="Resumen_SKU_referencia", index=False)
     bio.seek(0)
     return bio.getvalue()
 
@@ -233,6 +561,7 @@ def _render_ventas_excel_download(
     total_forecast: float,
     *,
     button_key: str,
+    sku_producto: dict[str, str] | None = None,
 ) -> None:
     """Botón de descarga Excel alineado con la tarjeta y el gráfico."""
     st.markdown("### 📥 Exportar proyección")
@@ -249,6 +578,7 @@ def _render_ventas_excel_download(
             month_trim_meta=month_trim_meta,
             sku_count=sku_count,
             total_hist=total_hist,
+            sku_producto=sku_producto,
         )
         st.download_button(
             "⬇️ Descargar proyección de ventas (Excel)",
@@ -1526,7 +1856,11 @@ def _build_monthly_sales_clp_chart(
     return bars + rule + ann, monthly
 
 
-def _render_reporteria_tab(ventas: pd.DataFrame, stock: pd.DataFrame) -> None:
+def _render_reporteria_tab(
+    ventas: pd.DataFrame,
+    stock: pd.DataFrame,
+    sku_producto: dict[str, str] | None = None,
+) -> None:
     """Reportería equivalente a app_reporteria.py usando ventas/stock ya cargados."""
     st.caption(
         "Mismos datos de ventas y stock que usaste para compras (sin Google Sheets ni API)."
@@ -1557,14 +1891,16 @@ def _render_reporteria_tab(ventas: pd.DataFrame, stock: pd.DataFrame) -> None:
     if top10.empty:
         st.info("No hay ventas en el rango de días seleccionado para el ranking.")
     else:
-        _show_reporteria_table(top10)
+        top10_show = _attach_producto(top10, sku_producto)
+        _show_reporteria_table(top10_show)
+        tip_cols = [c for c in ("sku", PRODUCTO_COL, "qty") if c in top10_show.columns]
         bar_top10 = (
-            alt.Chart(top10)
+            alt.Chart(top10_show)
             .mark_bar()
             .encode(
                 x=alt.X("qty:Q", title="Unidades vendidas"),
                 y=alt.Y("sku:N", sort="-x", title="SKU"),
-                tooltip=["sku", "qty"],
+                tooltip=tip_cols,
             )
             .properties(height=300)
         )
@@ -1613,14 +1949,14 @@ def _render_reporteria_tab(ventas: pd.DataFrame, stock: pd.DataFrame) -> None:
         if en_alza.empty:
             st.info("No hay productos en alza para el período.")
         else:
-            _show_reporteria_table(en_alza.head(20))
+            _show_reporteria_table(_attach_producto(en_alza.head(20), sku_producto))
     with col_2:
         st.markdown("📉 **En baja**")
         en_baja = alzabaja[alzabaja["delta"] < 0].sort_values("delta", ascending=True)
         if en_baja.empty:
             st.info("No hay productos en baja para el período.")
         else:
-            _show_reporteria_table(en_baja.head(20))
+            _show_reporteria_table(_attach_producto(en_baja.head(20), sku_producto))
 
     st.subheader("📦 Productos sobre-stockeados")
     ultimos_60 = fecha_corte - timedelta(days=60)
@@ -1647,18 +1983,26 @@ def _render_reporteria_tab(ventas: pd.DataFrame, stock: pd.DataFrame) -> None:
         st.info("No se detectaron productos sobre-stockeados con los criterios actuales.")
         top_cobertura = over.sort_values("dias_cobertura", ascending=False).head(20)
         st.write("Top por cobertura (referencia):")
-        _show_reporteria_table(top_cobertura[["sku", "stock", "consumo_60d", "dias_cobertura"]])
-    else:
         _show_reporteria_table(
-            overstock[["sku", "stock", "consumo_60d", "dias_cobertura"]].head(50)
+            _attach_producto(
+                top_cobertura[["sku", "stock", "consumo_60d", "dias_cobertura"]],
+                sku_producto,
+            )
         )
+    else:
+        over_show = _attach_producto(
+            overstock[["sku", "stock", "consumo_60d", "dias_cobertura"]].head(50),
+            sku_producto,
+        )
+        _show_reporteria_table(over_show)
+        tip_over = [c for c in ("sku", PRODUCTO_COL, "stock", "dias_cobertura") if c in over_show.columns]
         chart_over = (
-            alt.Chart(overstock.head(20))
+            alt.Chart(_attach_producto(overstock.head(20), sku_producto))
             .mark_bar()
             .encode(
                 x=alt.X("dias_cobertura:Q", title="Días de cobertura"),
                 y=alt.Y("sku:N", sort="-x", title="SKU"),
-                tooltip=["sku", "stock", "dias_cobertura"],
+                tooltip=tip_over,
             )
             .properties(height=400)
         )
@@ -1671,7 +2015,10 @@ def _render_reporteria_tab(ventas: pd.DataFrame, stock: pd.DataFrame) -> None:
         st.info("No se detectaron productos con bajo stock.")
     else:
         st.dataframe(
-            bajo_stock[["sku", "stock", "consumo_60d", "dias_cobertura"]],
+            _attach_producto(
+                bajo_stock[["sku", "stock", "consumo_60d", "dias_cobertura"]],
+                sku_producto,
+            ),
             use_container_width=True,
             hide_index=True,
         )
@@ -2054,6 +2401,7 @@ def _render_ventas_predictor_tab() -> None:
 
     det_v = out.get("det_v")
     res_v = out.get("res_v")
+    sp_map = run.get("sku_producto") or {}
     if res_v is not None and not res_v.empty and "meses_winsorizados" in res_v.columns:
         win_rows = res_v.loc[pd.to_numeric(res_v["meses_winsorizados"], errors="coerce").fillna(0) > 0]
         if not win_rows.empty:
@@ -2108,8 +2456,11 @@ def _render_ventas_predictor_tab() -> None:
             st.write(f"**Filas después de normalización:** {len(ventas_ext)}")
             if not ventas_ext.empty and "venta_neta" in ventas_ext.columns:
                 st.write(f"**Total venta_neta (monto $) tras normalizar:** ${float(ventas_ext['venta_neta'].sum()):,.0f}")
+                prev_cols = ["fecha", "sku", "venta_neta"]
+                if PRODUCTO_COL in ventas_ext.columns:
+                    prev_cols.insert(2, PRODUCTO_COL)
                 st.dataframe(
-                    ventas_ext[["fecha", "sku", "venta_neta"]].head(),
+                    _attach_producto(ventas_ext[prev_cols].head(), sp_map),
                     use_container_width=True,
                 )
 
@@ -2231,7 +2582,7 @@ def _render_ventas_predictor_tab() -> None:
                     f"⚠️ **{int(n_alert)}** SKU(s) con advertencia en **alerta_inflacion** "
                     "(forecast muy alto vs. promedio histórico × horizonte)."
                 )
-        st.dataframe(res_v, use_container_width=True, hide_index=True)
+        st.dataframe(_attach_producto(res_v, sp_map), use_container_width=True, hide_index=True)
 
         has_metrics = any(
             col in res_v.columns for col in ["mape", "rmse", "mae", "demand_class", "adi", "cv2"]
@@ -2246,11 +2597,11 @@ def _render_ventas_predictor_tab() -> None:
                     available_metrics.insert(0, "sku")
                 if "modelo" in res_v.columns and "modelo" not in available_metrics:
                     available_metrics.insert(1, "modelo")
-                metrics_df = res_v[available_metrics].copy()
+                metrics_df = _attach_producto(res_v[available_metrics].copy(), sp_map)
                 st.dataframe(metrics_df, use_container_width=True, hide_index=True)
 
     if det_v is not None and not det_v.empty:
-        det_show = _sort_sales_det_for_display(det_v)
+        det_show = _attach_producto(_sort_sales_det_for_display(det_v), sp_map)
         st.caption(
             "Vista agregada por mes (todos los SKUs). "
             "**Azul:** últimos 6 **meses completos** (Total Línea; el mes en curso parcial no se muestra). "
@@ -2332,6 +2683,7 @@ def _render_ventas_predictor_tab() -> None:
             total_hist=total_hist,
             total_forecast=total_forecast,
             button_key="excel_v2_dl_ventas_proyeccion",
+            sku_producto=sp_map,
         )
 
 
@@ -2365,7 +2717,7 @@ else:
 st.markdown("### ⚙️ Parámetros de predicción")
 col_a, col_b, col_c = st.columns(3)
 freq = col_a.selectbox("Frecuencia", ["Mensual (M)", "Semanal (W)"], index=0)
-horizon = col_b.slider("Horizonte (períodos)", 2, 24, 6, 1)
+horizon = col_b.slider("Horizonte (períodos)", 1, 24, 2, 1)
 modo = col_c.selectbox("Modo", ["Global", "Por SKU"], index=0)
 sku_q = st.text_input("SKU (opcional)") if modo == "Por SKU" else None
 
@@ -2630,6 +2982,7 @@ if st.button("Cargar Excel y ejecutar predicción", type="primary", use_containe
         )
 
     ventas_raw_full = raw_ventas_df.copy()
+    sku_producto_map = build_sku_producto_map(ventas_raw_full)
 
     if modo == "Por SKU" and sku_q:
         f = str(sku_q).strip().upper()
@@ -2658,6 +3011,14 @@ if st.button("Cargar Excel y ejecutar predicción", type="primary", use_containe
             st.error(f"Error al calcular la predicción: {type(e).__name__}: {e}")
             st.stop()
 
+    det = _realign_compras_detalle_to_global_calendar(
+        det, ventas, fcode, int(horizon)
+    )
+
+    res, prop = _enrich_compras_prediction_reliability(
+        res, prop, inbound if not inbound.empty else None
+    )
+
     st.session_state[SESSION_RUN_KEY] = {
         "ventas_raw": raw_ventas_df.copy(),
         "ventas_raw_full": ventas_raw_full.copy(),
@@ -2675,7 +3036,13 @@ if st.button("Cargar Excel y ejecutar predicción", type="primary", use_containe
         "horizon": int(horizon),
         "modo": modo,
         "sku_filtro": str(sku_q).strip() if (modo == "Por SKU" and sku_q) else "",
+        "sku_producto": sku_producto_map,
     }
+    if sku_producto_map:
+        st.caption(
+            f"Descripción de producto cargada para **{len(sku_producto_map):,}** SKU(s) "
+            f"(columna **Producto** del informe de ventas)."
+        )
     st.success("Listo. Usa el selector inferior para compras, reportería y ventas.")
 
 run = st.session_state.get(SESSION_RUN_KEY)
@@ -2692,13 +3059,17 @@ if run is not None:
 
     if section == _SECTION_LABELS[0]:
         st.subheader("Predictor de compras")
+        sp_map = run.get("sku_producto") or {}
         if run.get("mostrar_previo"):
             st.subheader("Vista previa canónica")
-            st.dataframe(run["ventas"].head(20), use_container_width=True)
-            st.dataframe(run["stock"].head(20), use_container_width=True)
-            st.dataframe(run["inbound"].head(50), use_container_width=True)
+            st.dataframe(_attach_producto(run["ventas"].head(20), sp_map), use_container_width=True)
+            st.dataframe(_attach_producto(run["stock"].head(20), sp_map), use_container_width=True)
+            st.dataframe(_attach_producto(run["inbound"].head(50), sp_map), use_container_width=True)
             st.caption("Parámetros de compra (config final enviada al core)")
-            st.dataframe(run.get("config", pd.DataFrame()).head(50), use_container_width=True)
+            st.dataframe(
+                _attach_producto(run.get("config", pd.DataFrame()).head(50), sp_map),
+                use_container_width=True,
+            )
         ul = run.get("upload_run_log")
         if ul is not None:
             log_body, all_from_upload = ul
@@ -2706,19 +3077,27 @@ if run is not None:
                 st.success(log_body)
             else:
                 st.info(log_body)
+        _show_compras_reliability_summary(run["res"])
         st.subheader("Detalle")
-        st.dataframe(run["det"].head(100), use_container_width=True)
+        st.dataframe(_attach_producto(run["det"].head(100), sp_map), use_container_width=True)
         st.subheader("Resumen")
-        st.dataframe(run["res"].head(100), use_container_width=True)
+        st.caption(
+            "Incluye **estado_prediccion**, **confianza_prediccion**, **accion_recomendada**, "
+            "**nota_prediccion**, **alerta_datos** y **demanda_referencial**."
+        )
+        st.dataframe(_attach_producto(run["res"].head(100), sp_map), use_container_width=True)
         st.subheader("Propuesta")
-        st.dataframe(run["prop"].head(100), use_container_width=True)
+        st.dataframe(_attach_producto(run["prop"].head(100), sp_map), use_container_width=True)
         st.subheader("Exportar predicción (compras)")
         st.caption(
-            "Excel en memoria: hojas Detalle, Resumen, Propuesta. No se guarda en el servidor."
+            "Excel en memoria: hojas Detalle, Resumen, Propuesta (incluye **producto** y "
+            "columnas de confiabilidad en Resumen/Propuesta). No se guarda en el servidor."
         )
         try:
             xlsx_bytes = _prediction_tables_to_excel_bytes(
-                run["det"], run["res"], run["prop"]
+                _attach_producto(run["det"], sp_map),
+                _attach_producto(run["res"], sp_map),
+                _attach_producto(run["prop"], sp_map),
             )
         except ImportError:
             st.warning(
@@ -2737,7 +3116,11 @@ if run is not None:
             )
     elif section == _SECTION_LABELS[1]:
         st.subheader("Reportería de ventas")
-        _render_reporteria_tab(run["ventas"], run["stock"])
+        _render_reporteria_tab(
+            run["ventas"],
+            run["stock"],
+            sku_producto=run.get("sku_producto"),
+        )
     else:
         _render_ventas_predictor_tab()
 
