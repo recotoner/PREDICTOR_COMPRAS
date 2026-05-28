@@ -62,6 +62,37 @@ def _normalize_sku_series(s: pd.Series) -> pd.Series:
     return sku.str.strip().str.upper()
 
 
+def build_sku_producto_map(raw: pd.DataFrame) -> dict[str, str]:
+    """
+    Diccionario sku (normalizado) → descripción desde columna Producto del export de ventas.
+    Si un SKU aparece varias veces, se conserva la última descripción no vacía del archivo.
+    """
+    if raw is None or raw.empty:
+        return {}
+    c_sku = _col_by_fold(raw.columns, "sku")
+    c_prod = _col_by_fold(raw.columns, "producto")
+    if not c_prod:
+        c_prod = _col_contains(raw.columns, "producto")
+    if not c_sku or not c_prod:
+        return {}
+    tmp = pd.DataFrame()
+    tmp["sku"] = _normalize_sku_series(raw[c_sku])
+    tmp["producto"] = (
+        raw[c_prod]
+        .astype(str)
+        .fillna("")
+        .str.replace(r"\.0$", "", regex=True)
+        .str.strip()
+    )
+    tmp = tmp[(tmp["sku"] != "") & (tmp["producto"] != "")]
+    bad = tmp["producto"].str.upper().isin(["NAN", "NONE", "NAT"])
+    tmp = tmp.loc[~bad]
+    if tmp.empty:
+        return {}
+    tmp = tmp.drop_duplicates(subset=["sku"], keep="last")
+    return dict(zip(tmp["sku"], tmp["producto"]))
+
+
 def load_ventas_kame_df(raw: pd.DataFrame, source_label: str = "ventas") -> pd.DataFrame:
     """S1: DataFrame crudo de export ventas → fecha, sku, qty."""
     c_fecha = _col_by_fold(raw.columns, "fecha")
